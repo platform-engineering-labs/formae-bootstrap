@@ -1,0 +1,4 @@
+# Self-signed TLS material for the agent ALB (generate locally with openssl; see README).
+# Never commit private keys or environment-specific certs.
+cert.key
+cert.crt

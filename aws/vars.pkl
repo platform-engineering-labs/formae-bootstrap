@@ -1,0 +1,24 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+import "@formae/formae.pkl"
+
+projectName = "formae-bootstrap"
+region = "us-east-2"
+vpcCidr = "10.100.0.0/16"
+subnetCidr1 = "10.100.1.0/24"
+subnetCidr2 = "10.100.2.0/24"
+dbName = "formae"
+dbUser = "formae"
+dbInstanceClass = "db.t4g.small"
+dbEngineVersion = "16.14"
+formaeImage = "ghcr.io/platform-engineering-labs/formae:0.86.2"
+formaePort = 49684
+
+stack: formae.Stack = new {
+    label = "formae-bootstrap"
+    description = "Formae production infrastructure on AWS"
+}

@@ -1,0 +1,715 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+amends "@formae/forma.pkl"
+import "@formae/formae.pkl"
+import "@aws/aws.pkl"
+
+import "@aws/ec2/vpc.pkl"
+import "@aws/ec2/internetgateway.pkl"
+import "@aws/ec2/vpcgatewayattachment.pkl"
+import "@aws/ec2/subnet.pkl"
+import "@aws/ec2/routetable.pkl"
+import "@aws/ec2/route.pkl"
+import "@aws/ec2/subnetroutetableassociation.pkl"
+import "@aws/ec2/securitygroup.pkl"
+import "@aws/ec2/securitygroupingress.pkl"
+
+import "@aws/rds/dbinstance.pkl"
+import "@aws/rds/dbsubnetgroup.pkl"
+import "@aws/secretsmanager/secret.pkl"
+import "@formae/ext/random.pkl"
+
+import "@aws/ecs/ecscluster.pkl"
+import "@aws/ecs/taskdefinition.pkl"
+import "@aws/ecs/service.pkl"
+
+import "@aws/iam/role.pkl"
+import "@aws/iam/servercertificate.pkl"
+
+import "@aws/logs/loggroup.pkl"
+
+import "@aws/elasticloadbalancingv2/loadbalancer.pkl"
+import "@aws/elasticloadbalancingv2/targetgroup.pkl"
+import "@aws/elasticloadbalancingv2/listener.pkl"
+
+import "./vars.pkl"
+
+description {
+    text = """
+    Formae Bootstrap on AWS
+
+    Stands up a formae agent on ECS Fargate behind an ALB. One entrypoint, two
+    database modes via --database:
+    - "new"      (default): also provisions an RDS PostgreSQL with a generated
+                  master password in Secrets Manager.
+    - "existing": brings your own PostgreSQL; supply --db-host and
+                  --db-password-secret-arn. No database is created.
+    """
+    confirm = true
+}
+
+properties {
+    name = new formae.Prop {
+        flag = "name"
+        default = vars.projectName
+    }
+    // --region/--aws-profile govern the LOCAL apply credentials (which build the infra),
+    // not the deployed agent (which authenticates via its ECS task role).
+    // NB: the flag is --aws-profile, not --profile, because formae reserves --profile
+    // for its own CLI profile (formae profile ...).
+    region = new formae.Prop {
+        flag = "region"
+        default = vars.region
+    }
+    profile = new formae.Prop {
+        flag = "aws-profile"
+        default = ""
+    }
+    // "new" provisions an RDS database; "existing" points the agent at one you run.
+    database = new formae.Prop {
+        flag = "database"
+        default = "new"
+    }
+    // "public" = internet-facing ALB on 0.0.0.0/0 (laptop-reachable, plaintext HTTP);
+    // "internal" = internal ALB scoped to the VPC CIDR, no public task IPs (reach via VPN/peering).
+    visibility = new formae.Prop {
+        flag = "visibility"
+        default = "public"
+    }
+    // ECS Fargate t-shirt size; maps to a Fargate-legal cpu/memory pair (see fargateSizes).
+    size = new formae.Prop {
+        flag = "size"
+        default = "small"
+    }
+    // Existing-database connection (consumed only when --database=existing).
+    // host + password-secret-arn are required in that mode.
+    dbHost = new formae.Prop {
+        flag = "db-host"
+        default = ""
+    }
+    dbPort = new formae.Prop {
+        flag = "db-port"
+        default = "5432"
+    }
+    // New mode defaults to the vars values (used for the DB we create); existing mode
+    // has no safe default (the value depends on your DB), so it defaults empty and is
+    // required (see dbUserExpr/dbNameExpr below).
+    dbUser = new formae.Prop {
+        flag = "db-user"
+        default = ""
+    }
+    dbName = new formae.Prop {
+        flag = "db-name"
+        default = ""
+    }
+    // Secrets Manager ARN whose value is the DB password (or ARN + key selector,
+    // e.g. `...:secret:name:password::`, for a JSON secret).
+    dbPasswordSecretArn = new formae.Prop {
+        flag = "db-password-secret-arn"
+        default = ""
+    }
+    // VPC + subnet CIDRs. Subnets MUST sit within the VPC CIDR (AWS rejects mismatches);
+    // vpcCidr also scopes the internal-mode SG ingress, so keep it tight.
+    vpcCidr = new formae.Prop {
+        flag = "vpc-cidr"
+        default = vars.vpcCidr
+    }
+    subnetCidr1 = new formae.Prop {
+        flag = "subnet-cidr-1"
+        default = vars.subnetCidr1
+    }
+    subnetCidr2 = new formae.Prop {
+        flag = "subnet-cidr-2"
+        default = vars.subnetCidr2
+    }
+}
+
+local n = properties.name.value
+local isNew = properties.database.value == "new"
+local isPublic = properties.visibility.value == "public"
+
+// Validate CIDR shape early (clearer than a slow AWS round-trip). AWS still enforces
+// subnet-within-VPC containment, so an out-of-range subnet is caught at apply.
+local cidrRegex = Regex(#"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"#)
+local function asCidr(value: String, flag: String): String =
+    if (value.matches(cidrRegex)) value
+    else throw("\(flag) must be a CIDR like 10.0.0.0/16, got: \(value)")
+local vpcCidrVal = asCidr(properties.vpcCidr.value, "--vpc-cidr")
+local subnetCidr1Val = asCidr(properties.subnetCidr1.value, "--subnet-cidr-1")
+local subnetCidr2Val = asCidr(properties.subnetCidr2.value, "--subnet-cidr-2")
+
+// Fargate-legal cpu/memory per t-shirt size (1 vCPU needs >=2GB, 2 vCPU >=4GB, 4 vCPU >=8GB).
+local fargateSizes = new Mapping {
+    ["small"] { cpu = "512"; memory = "1024" }
+    ["medium"] { cpu = "1024"; memory = "2048" }
+    ["large"] { cpu = "2048"; memory = "4096" }
+    ["xlarge"] { cpu = "4096"; memory = "8192" }
+}
+local taskSize = fargateSizes[properties.size.value]
+
+// New mode resolves the host from the provisioned DB at runtime via $FORMAE_DB_HOST;
+// existing mode bakes the supplied host into the agent config at apply time.
+local dbHostExpr =
+    if (isNew) "$FORMAE_DB_HOST"
+    else if (properties.dbHost.value == "") throw("--db-host is required when --database=existing")
+    else properties.dbHost.value
+
+// New mode uses the vars values (for the DB we create); existing mode requires explicit
+// --db-user/--db-name rather than silently inheriting "formae" and connecting to the wrong DB.
+local dbUserExpr =
+    if (isNew) vars.dbUser
+    else if (properties.dbUser.value == "") throw("--db-user is required when --database=existing")
+    else properties.dbUser.value
+local dbNameExpr =
+    if (isNew) vars.dbName
+    else if (properties.dbName.value == "") throw("--db-name is required when --database=existing")
+    else properties.dbName.value
+
+// Manifest of everything this stack deploys, in dependency order; definitions follow below.
+forma {
+    vars.stack
+    new formae.Target {
+        label = "bootstrap-target"
+        config = new aws.Config {
+            region = properties.region.value
+            profile = if (properties.profile.value == "") null else properties.profile.value
+        }
+    }
+
+    // networking
+    vpcRes
+    igw
+    igwAttach
+    subnet1
+    subnet2
+    rt
+    defaultRoute
+    rtAssoc1
+    rtAssoc2
+
+    // database (only when --database=new)
+    when (isNew) {
+        dbSg
+        dbSgIngress
+        dbSubnetGroup
+        dbSecret
+        db
+    }
+
+    // agent compute (ECS Fargate)
+    taskExecRole
+    taskRole
+    logGrp
+    ecsCluster
+    taskDef
+
+    // load balancer + service
+    albSg
+    albSgIngress
+    taskSg
+    taskSgIngress
+    alb
+    tg
+    serverCert
+    albListener
+    ecsService
+}
+
+// Definitions, in the same order as the manifest above.
+
+// networking
+local vpcRes = new vpc.VPC {
+    label = "\(n)-vpc"
+    cidrBlock = vpcCidrVal
+    enableDnsHostnames = true
+    enableDnsSupport = true
+    tags { new { key = "Name"; value = "\(n)-vpc" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local igw = new internetgateway.InternetGateway {
+    label = "\(n)-igw"
+    tags { new { key = "Name"; value = "\(n)-igw" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local igwAttach = new vpcgatewayattachment.VPCGatewayAttachment {
+    label = "\(n)-igw-attach"
+    vpcId = vpcRes.res.id
+    internetGatewayId = igw.res.id
+}
+
+local subnet1 = new subnet.Subnet {
+    label = "\(n)-subnet-1"
+    vpcId = vpcRes.res.id
+    cidrBlock = subnetCidr1Val
+    availabilityZone = "\(properties.region.value)a"
+    mapPublicIpOnLaunch = true
+    tags { new { key = "Name"; value = "\(n)-subnet-1" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local subnet2 = new subnet.Subnet {
+    label = "\(n)-subnet-2"
+    vpcId = vpcRes.res.id
+    cidrBlock = subnetCidr2Val
+    availabilityZone = "\(properties.region.value)b"
+    mapPublicIpOnLaunch = true
+    tags { new { key = "Name"; value = "\(n)-subnet-2" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local rt = new routetable.RouteTable {
+    label = "\(n)-rt"
+    vpcId = vpcRes.res.id
+    tags { new { key = "Name"; value = "\(n)-rt" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local defaultRoute = new route.Route {
+    label = "\(n)-route"
+    routeTableId = rt.res.id
+    destinationCidrBlock = "0.0.0.0/0"
+    gatewayId = igw.res.id
+}
+
+local rtAssoc1 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+    label = "\(n)-rt-assoc-1"
+    subnetId = subnet1.res.id
+    routeTableId = rt.res.id
+}
+
+local rtAssoc2 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+    label = "\(n)-rt-assoc-2"
+    subnetId = subnet2.res.id
+    routeTableId = rt.res.id
+}
+
+// database (only emitted when --database=new)
+local dbSg = new securitygroup.SecurityGroup {
+    label = "\(n)-db-sg"
+    groupDescription = "Allow PostgreSQL from within the VPC (the ECS task)"
+    vpcId = vpcRes.res.id
+    tags { new { key = "Name"; value = "\(n)-db-sg" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local dbSgIngress = new securitygroupingress.SecurityGroupIngress {
+    label = "\(n)-db-sg-ingress"
+    ipProtocol = "tcp"
+    fromPort = 5432
+    toPort = 5432
+    cidrIp = vpcCidrVal
+    groupId = dbSg.res.groupId
+}
+
+local dbSubnetGroup = new dbsubnetgroup.DBSubnetGroup {
+    label = "\(n)-db-subnet-group"
+    dbSubnetGroupDescription = "Subnet group for the formae database"
+    subnetIds { subnet1.res.subnetId; subnet2.res.subnetId }
+    tags { new { key = "Name"; value = "\(n)-db-subnet-group" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local dbSecret = new secret.Secret {
+    label = "\(n)-db-secret"
+    name = "\(n)-db-password"
+    description = "formae database master password (generated)"
+    secretString = formae.value(random.password(24, false)).opaque.setOnce
+    tags { new { key = "Name"; value = "\(n)-db-secret" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local db = new dbinstance.DBInstance {
+    label = "\(n)-db"
+    dbInstanceIdentifier = "\(n)-db"
+    engine = "postgres"
+    engineVersion = vars.dbEngineVersion
+    dbInstanceClass = vars.dbInstanceClass
+    allocatedStorage = "20"
+    // Storage autoscaling ceiling. Multi-AZ is left off for a lean example default;
+    // enable multiAZ + raise this for production (see README).
+    maxAllocatedStorage = 100
+    dbName = dbNameExpr
+    masterUsername = dbUserExpr
+    masterUserPassword = dbSecret.res.secretString
+    dbSubnetGroupName = dbSubnetGroup.res.dbSubnetGroupName
+    vpcSecurityGroups { dbSg.res.groupId }
+    storageEncrypted = true
+    publiclyAccessible = false
+    multiAZ = false
+    tags { new { key = "Name"; value = "\(n)-db" }; new { key = "app"; value = "formae-agent" } }
+}
+
+// agent compute (ECS Fargate)
+local ecsAssumeRole = new Dynamic {
+    ["Version"] = "2012-10-17"
+    ["Statement"] = new Listing {
+        new Dynamic {
+            ["Effect"] = "Allow"
+            ["Principal"] = new Dynamic { ["Service"] = "ecs-tasks.amazonaws.com" }
+            ["Action"] = "sts:AssumeRole"
+        }
+    }
+}
+
+local taskExecRole = new role.Role {
+    label = "\(n)-exec-role"
+    roleName = "\(n)-exec-role"
+    assumeRolePolicyDocument = ecsAssumeRole
+    managedPolicyArns {
+        "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+    }
+    policies {
+        new role.RolePolicy {
+            policyName = "\(n)-secrets-access"
+            policyDocument {
+                ["Version"] = "2012-10-17"
+                ["Statement"] = new Listing {
+                    new Dynamic {
+                        ["Effect"] = "Allow"
+                        ["Action"] = "secretsmanager:GetSecretValue"
+                        ["Resource"] = "*"
+                    }
+                }
+            }
+        }
+    }
+    tags { new { key = "Name"; value = "\(n)-exec-role" }; new { key = "app"; value = "formae-agent" } }
+}
+
+// The agent's operating identity. PowerUserAccess excludes IAM, so the inline policy adds
+// IAM management + iam:List*/Get* (without the reads, discovery 403-spams every cycle).
+// The ssmmessages perms back `aws ecs execute-command` (shell into the running agent).
+local taskRole = new role.Role {
+    label = "\(n)-task-role"
+    roleName = "\(n)-task-role"
+    assumeRolePolicyDocument = ecsAssumeRole
+    managedPolicyArns {
+        "arn:aws:iam::aws:policy/PowerUserAccess"
+    }
+    policies {
+        new role.RolePolicy {
+            policyName = "\(n)-iam"
+            policyDocument {
+                ["Version"] = "2012-10-17"
+                ["Statement"] = new Listing {
+                    new Dynamic {
+                        ["Effect"] = "Allow"
+                        ["Action"] = new Listing {
+                            "iam:CreateRole"
+                            "iam:DeleteRole"
+                            "iam:GetRole"
+                            "iam:ListRoles"
+                            "iam:UpdateRole"
+                            "iam:UpdateAssumeRolePolicy"
+                            "iam:TagRole"
+                            "iam:UntagRole"
+                            "iam:PutRolePolicy"
+                            "iam:DeleteRolePolicy"
+                            "iam:GetRolePolicy"
+                            "iam:ListRolePolicies"
+                            "iam:AttachRolePolicy"
+                            "iam:DetachRolePolicy"
+                            "iam:ListAttachedRolePolicies"
+                            "iam:CreatePolicy"
+                            "iam:DeletePolicy"
+                            "iam:GetPolicy"
+                            "iam:ListPolicies"
+                            "iam:CreatePolicyVersion"
+                            "iam:DeletePolicyVersion"
+                            "iam:GetPolicyVersion"
+                            "iam:ListPolicyVersions"
+                            "iam:SetDefaultPolicyVersion"
+                            "iam:CreateInstanceProfile"
+                            "iam:DeleteInstanceProfile"
+                            "iam:GetInstanceProfile"
+                            "iam:AddRoleToInstanceProfile"
+                            "iam:RemoveRoleFromInstanceProfile"
+                            "iam:CreateUser"
+                            "iam:DeleteUser"
+                            "iam:GetUser"
+                            "iam:TagUser"
+                            "iam:UntagUser"
+                            "iam:CreateGroup"
+                            "iam:DeleteGroup"
+                            "iam:GetGroup"
+                            "iam:PassRole"
+                        }
+                        ["Resource"] = "*"
+                    }
+                    new Dynamic {
+                        ["Effect"] = "Allow"
+                        ["Action"] = new Listing {
+                            "iam:Get*"
+                            "iam:List*"
+                        }
+                        ["Resource"] = "*"
+                    }
+                }
+            }
+        }
+        new role.RolePolicy {
+            policyName = "\(n)-ecs-exec"
+            policyDocument {
+                ["Version"] = "2012-10-17"
+                ["Statement"] = new Listing {
+                    new Dynamic {
+                        ["Effect"] = "Allow"
+                        ["Action"] = new Listing {
+                            "ssmmessages:CreateControlChannel"
+                            "ssmmessages:CreateDataChannel"
+                            "ssmmessages:OpenControlChannel"
+                            "ssmmessages:OpenDataChannel"
+                        }
+                        ["Resource"] = "*"
+                    }
+                }
+            }
+        }
+    }
+    tags { new { key = "Name"; value = "\(n)-task-role" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local logGrp = new loggroup.LogGroup {
+    label = "\(n)-logs"
+    logGroupName = "/ecs/\(n)"
+    retentionInDays = 14
+    tags { new { key = "Name"; value = "\(n)-logs" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local ecsCluster = new ecscluster.Cluster {
+    label = "\(n)-ecs-cluster"
+    clusterName = "\(n)-cluster"
+    tags { new { key = "Name"; value = "\(n)-cluster" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local configScript = new Listing {
+    "mkdir -p /home/pel/.config/formae &&"
+    "cat > /home/pel/.config/formae/formae.conf.pkl << PKLEOF"
+    "amends \"formae:/Config.pkl\""
+    "import \"plugins:/Aws.pkl\" as Aws"
+    "agent {"
+    "  server {"
+    "    port = \(vars.formaePort)"
+    "  }"
+    "  datastore {"
+    "    datastoreType = \"postgres\""
+    "    postgres {"
+    "      host = \"\(dbHostExpr)\""
+    "      port = \(properties.dbPort.value)"
+    "      user = \"\(dbUserExpr)\""
+    "      password = \"$FORMAE_DB_PASSWORD\""
+    "      database = \"\(dbNameExpr)\""
+    "      connectionParams = \"sslmode=require\""
+    "    }"
+    "  }"
+    "  synchronization {"
+    "    enabled = true"
+    "    interval = 300.s"
+    "  }"
+    "  discovery {"
+    "    enabled = true"
+    "    interval = 600.s"
+    "  }"
+    "  resourcePlugins {"
+    "    new Aws.PluginConfig {"
+    "      discoveryFilters = new Listing {"
+    "        new MatchFilter {"
+    "          resourceTypes = new Listing {"
+    "            \"AWS::EC2::VPC\""
+    "            \"AWS::EC2::Subnet\""
+    "            \"AWS::EC2::InternetGateway\""
+    "            \"AWS::EC2::RouteTable\""
+    "            \"AWS::EC2::SecurityGroup\""
+    "            \"AWS::RDS::DBInstance\""
+    "            \"AWS::RDS::DBSubnetGroup\""
+    "            \"AWS::SecretsManager::Secret\""
+    "            \"AWS::ECS::Cluster\""
+    "            \"AWS::ECS::Service\""
+    "            \"AWS::ECS::TaskDefinition\""
+    "            \"AWS::IAM::Role\""
+    "            \"AWS::Logs::LogGroup\""
+    "            \"AWS::ElasticLoadBalancingV2::LoadBalancer\""
+    "            \"AWS::ElasticLoadBalancingV2::TargetGroup\""
+    "          }"
+    "          conditions = new Listing {"
+    "            new FilterCondition {"
+    "              propertyPath = \"$.Tags[?(@.Key=='app')].Value\""
+    "              propertyValue = \"formae-agent\""
+    "            }"
+    "          }"
+    "        }"
+    "      }"
+    "    }"
+    "  }"
+    "}"
+    "PKLEOF"
+    "exec formae agent start"
+}.join("\n")
+
+local taskDef = new taskdefinition.TaskDefinition {
+    label = "\(n)-task-def"
+    family = "\(n)-task"
+    requiresCompatibilities { "FARGATE" }
+    networkMode = "awsvpc"
+    cpu = taskSize.cpu
+    memory = taskSize.memory
+    executionRoleArn = taskExecRole.res.arn
+    taskRoleArn = taskRole.res.arn
+    containerDefinitions {
+        new taskdefinition.ContainerDefinition {
+            name = "formae-agent"
+            image = vars.formaeImage
+            essential = true
+            entryPoint { "sh"; "-c" }
+            command { configScript }
+            portMappings {
+                new taskdefinition.PortMapping {
+                    containerPort = vars.formaePort
+                    protocol = "tcp"
+                }
+            }
+            // New mode injects the provisioned DB host as an env var; existing mode
+            // bakes the supplied host into the config script, so no host env var.
+            environment {
+                when (isNew) {
+                    new taskdefinition.KeyValuePair {
+                        name = "FORMAE_DB_HOST"
+                        value = db.res.endpointAddress
+                    }
+                }
+            }
+            // Password injected at runtime from Secrets Manager (never in the task def):
+            // new mode uses the in-stack Secret, existing mode the secret ARN you supply.
+            secrets {
+                new taskdefinition.Secret {
+                    name = "FORMAE_DB_PASSWORD"
+                    valueFrom =
+                        if (isNew) dbSecret.res.arn
+                        else if (properties.dbPasswordSecretArn.value == "") throw("--db-password-secret-arn is required when --database=existing")
+                        else properties.dbPasswordSecretArn.value
+                }
+            }
+            logConfiguration = new taskdefinition.LogConfiguration {
+                logDriver = "awslogs"
+                options {
+                    ["awslogs-group"] = "/ecs/\(n)"
+                    ["awslogs-region"] = vars.region
+                    ["awslogs-stream-prefix"] = "formae"
+                }
+            }
+        }
+    }
+    tags { new { key = "Name"; value = "\(n)-task-def" }; new { key = "app"; value = "formae-agent" } }
+}
+
+// load balancer + service
+local albSg = new securitygroup.SecurityGroup {
+    label = "\(n)-alb-sg"
+    groupDescription = "Allow formae API traffic"
+    vpcId = vpcRes.res.id
+    tags { new { key = "Name"; value = "\(n)-alb-sg" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local albSgIngress = new securitygroupingress.SecurityGroupIngress {
+    label = "\(n)-alb-sg-ingress"
+    ipProtocol = "tcp"
+    fromPort = vars.formaePort
+    toPort = vars.formaePort
+    cidrIp = if (isPublic) "0.0.0.0/0" else vpcCidrVal
+    groupId = albSg.res.groupId
+}
+
+local taskSg = new securitygroup.SecurityGroup {
+    label = "\(n)-task-sg"
+    groupDescription = "Allow traffic from ALB to formae tasks"
+    vpcId = vpcRes.res.id
+    tags { new { key = "Name"; value = "\(n)-task-sg" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local taskSgIngress = new securitygroupingress.SecurityGroupIngress {
+    label = "\(n)-task-sg-ingress"
+    ipProtocol = "tcp"
+    fromPort = vars.formaePort
+    toPort = vars.formaePort
+    sourceSecurityGroupId = albSg.res.groupId
+    groupId = taskSg.res.groupId
+}
+
+local alb = new loadbalancer.LoadBalancer {
+    label = "\(n)-alb"
+    name = "\(n)-alb"
+    subnets { subnet1.res.subnetId; subnet2.res.subnetId }
+    securityGroups { albSg.res.groupId }
+    scheme = if (isPublic) "internet-facing" else "internal"
+    type = "application"
+    tags { new { key = "Name"; value = "\(n)-alb" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local tg = new targetgroup.TargetGroup {
+    label = "\(n)-tg"
+    name = "\(n)-tg"
+    vpcId = vpcRes.res.id
+    port = vars.formaePort
+    protocol = "HTTP"
+    targetType = "ip"
+    healthCheckEnabled = true
+    healthCheckPath = "/api/v1/health"
+    healthCheckProtocol = "HTTP"
+    healthCheckPort = "\(vars.formaePort)"
+    matcher = new targetgroup.Matcher { httpCode = "200" }
+    healthCheckIntervalSeconds = 30
+    tags { new { key = "Name"; value = "\(n)-tg" }; new { key = "app"; value = "formae-agent" } }
+}
+
+// Self-signed cert for the ALB's HTTPS listener. The PEM is generated locally with
+// openssl (see README) and read in at eval time; cert.crt/cert.key are gitignored.
+local serverCert = new servercertificate.ServerCertificate {
+    label = "\(n)-cert"
+    serverCertificateName = "\(n)-cert"
+    certificateBody = read("./cert.crt").text
+    privateKey = read("./cert.key").text
+    tags { new { key = "Name"; value = "\(n)-cert" }; new { key = "app"; value = "formae-agent" } }
+}
+
+local albListener = new listener.Listener {
+    label = "\(n)-listener"
+    loadBalancerArn = alb.res.loadBalancerArn
+    port = vars.formaePort
+    protocol = "HTTPS"
+    sslPolicy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+    certificates {
+        new listener.Certificate { certificateArn = serverCert.res.arn }
+    }
+    defaultActions {
+        new listener.Action {
+            type = "forward"
+            targetGroupArn = tg.res.targetGroupArn
+        }
+    }
+}
+
+local ecsService = new service.Service {
+    label = "\(n)-ecs-service"
+    serviceName = "\(n)-service"
+    cluster = ecsCluster.res.arn
+    taskDefinition = new taskdefinition.TaskDefinitionResolvable {
+        label = taskDef.label
+        stack = vars.stack.label
+    }.taskDefinitionArn
+    desiredCount = 1
+    launchType = "FARGATE"
+    enableExecuteCommand = true
+    networkConfiguration = new service.NetworkConfiguration {
+        awsvpcConfiguration = new service.AwsVpcConfiguration {
+            assignPublicIp = if (isPublic) "ENABLED" else "DISABLED"
+            subnets { subnet1.res.subnetId; subnet2.res.subnetId }
+            securityGroups { taskSg.res.groupId }
+        }
+    }
+    loadBalancers {
+        new service.LoadBalancer {
+            targetGroupArn = tg.res.targetGroupArn
+            containerName = "formae-agent"
+            containerPort = vars.formaePort
+        }
+    }
+    tags { new { key = "Name"; value = "\(n)-service" }; new { key = "app"; value = "formae-agent" } }
+}
