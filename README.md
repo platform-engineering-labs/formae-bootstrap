@@ -1,6 +1,6 @@
 # formae-bootstrap
 
-Internal examples for standing up a self-hosted **formae agent** on a cloud provider.
+Stand up a self-hosted **formae agent** on a cloud provider.
 Each provider lives in its own directory.
 
 ## AWS
