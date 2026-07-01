@@ -682,10 +682,12 @@ local db = new dbinstance.DBInstance {
     engine = "postgres"
     engineVersion = vars.dbEngineVersion
     dbInstanceClass = vars.dbInstanceClass
-    allocatedStorage = "20"
+    // Storage as a typed DataSize; .toUnit("gib") normalizes to the GiB the schema expects,
+    // so the literal's unit can change safely.
+    allocatedStorage = 20.gib.toUnit("gib").value.toInt().toString()
     // Storage autoscaling ceiling. Multi-AZ is off for a lean default; enable multiAZ +
     // raise this for production (see README).
-    maxAllocatedStorage = 100
+    maxAllocatedStorage = 100.gib.toUnit("gib").value.toInt()
     dbName = dbNameExpr
     masterUsername = dbUserExpr
     masterUserPassword = dbSecret.res.secretString
@@ -927,7 +929,7 @@ local taskDef = new taskdefinition.TaskDefinition {
     requiresCompatibilities { "FARGATE" }
     networkMode = "awsvpc"
     cpu = taskSize.cpu
-    memory = taskSize.memory
+    memory = taskSize.memoryMib
     executionRoleArn = taskExecRole.res.arn
     taskRoleArn = taskRole.res.arn
     containerDefinitions {
