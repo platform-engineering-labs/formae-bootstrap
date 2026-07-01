@@ -1,0 +1,41 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+/// Agent sizing. Maps a t-shirt `size` to a Fargate-valid (cpu, memory) pair.
+///
+/// Capacity guidance mirrors the agent-sizing table at
+/// https://docs.formae.io/en/latest/operations/installation/#agent-sizing
+/// but is rounded UP to Fargate's allowed CPU/memory combinations (1 vCPU
+/// requires >=2GB, 2 vCPU >=4GB, 4 vCPU >=8GB) — the doc's raw numbers are not
+/// all Fargate-legal.
+module bootstrap.sizing
+
+typealias Size = "small" | "medium" | "large" | "xlarge"
+
+class Compute {
+    /// Fargate CPU units (256 = 0.25 vCPU, 1024 = 1 vCPU).
+    cpu: String
+    /// Memory in MiB.
+    memory: String
+}
+
+/// Memory has a FLOOR (~2 GB), independent of inventory size: the agent image
+/// loads all bundled resource plugins at once (aws + azure + gcp + k8s — k8s alone
+/// declares ~540 resource types), a large constant footprint. 1 GB OOM-kills the
+/// task on startup (verified 2026-07-01), so every tier is >= 2 GB.
+///
+/// small  ~  up to 1,000 resources   (0.5 vCPU / 2 GB)
+/// medium ~  1,000-5,000 resources   (1 vCPU   / 2 GB)
+/// large  ~  5,000-10,000 resources  (2 vCPU   / 4 GB)
+/// xlarge ~  10,000-20,000 resources (4 vCPU   / 8 GB)
+hidden table: Mapping<Size, Compute> = new {
+    ["small"]  = new { cpu = "512";  memory = "2048" }
+    ["medium"] = new { cpu = "1024"; memory = "2048" }
+    ["large"]  = new { cpu = "2048"; memory = "4096" }
+    ["xlarge"] = new { cpu = "4096"; memory = "8192" }
+}
+
+function forSize(s: Size): Compute = table[s]
