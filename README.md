@@ -1,10 +1,26 @@
 # formae-bootstrap
 
-Stand up a self-hosted **formae agent** on a cloud provider.
-Each provider lives in its own directory.
+Stand up a self-hosted **formae agent** on a cloud provider. Each provider lives in its own
+directory; AWS is the first.
+
+## How it works
+
+Formae is a **client + agent** system. You run both locally to start, use that local install
+to provision the agent's own permanent home in the cloud, then point your local CLI at the
+now-remote agent via a profile and hand off. From then on the remote agent owns your
+infrastructure — reconciling, discovering, and syncing continuously — while your laptop is
+just a client that talks to it. See [`aws/README.md`](aws/README.md#how-this-works) and the
+[architecture overview](https://docs.formae.io) for the full model.
 
 ## AWS
 
-[`aws/`](aws/) stands up a formae agent on ECS Fargate behind an **HTTPS** ALB
-(self-signed certificate by default), backed by RDS PostgreSQL. Full instructions in
-[`aws/README.md`](aws/README.md).
+[`aws/`](aws/) installs a production formae agent on ECS Fargate, backed by RDS PostgreSQL
+(or your own database). One command, two **secure** access modes — there is no plaintext
+option:
+
+- **`alb`** — public, internet-facing ALB terminating HTTPS with your own ACM certificate,
+  plus HTTP basic auth.
+- **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
+  serving a trusted `*.ts.net` certificate, with basic auth on top.
+
+Full instructions in [`aws/README.md`](aws/README.md).

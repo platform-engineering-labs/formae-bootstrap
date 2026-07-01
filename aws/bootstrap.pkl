@@ -17,6 +17,8 @@ import "@aws/ec2/route.pkl"
 import "@aws/ec2/subnetroutetableassociation.pkl"
 import "@aws/ec2/securitygroup.pkl"
 import "@aws/ec2/securitygroupingress.pkl"
+import "@aws/ec2/eip.pkl"
+import "@aws/ec2/natgateway.pkl"
 
 import "@aws/rds/dbinstance.pkl"
 import "@aws/rds/dbsubnetgroup.pkl"
@@ -28,39 +30,55 @@ import "@aws/ecs/taskdefinition.pkl"
 import "@aws/ecs/service.pkl"
 
 import "@aws/iam/role.pkl"
-import "@aws/iam/servercertificate.pkl"
-
 import "@aws/logs/loggroup.pkl"
 
 import "@aws/elasticloadbalancingv2/loadbalancer.pkl"
 import "@aws/elasticloadbalancingv2/targetgroup.pkl"
 import "@aws/elasticloadbalancingv2/listener.pkl"
 
+import "@aws/efs/filesystem.pkl"
+import "@aws/efs/mounttarget.pkl"
+import "@aws/efs/accesspoint.pkl"
+
 import "./vars.pkl"
+import "./sizing.pkl"
 
 description {
     text = """
-    Formae Bootstrap on AWS
+    Formae agent on AWS — the "install formae into a production environment" example.
+    One entrypoint, two secure access modes via --access (there is no plaintext option):
 
-    Stands up a formae agent on ECS Fargate behind an ALB. One entrypoint, two
-    database modes via --database:
-    - "new"      (default): also provisions an RDS PostgreSQL with a generated
-                  master password in Secrets Manager.
-    - "existing": brings your own PostgreSQL; supply --db-host and
-                  --db-password-secret-arn. No database is created.
+      alb      Public, internet-facing ALB terminating HTTPS with YOUR ACM certificate
+               (--cert-arn + --domain), with HTTP basic auth on top. Requires a domain
+               you own. Optionally restrict ingress with --allow-cidr.
+
+      tailnet  Private, reached only over your Tailscale tailnet — no public ingress.
+               The agent joins the tailnet (--ts-authkey) and serves a trusted *.ts.net
+               certificate. Mirrors our production topology: private subnets + NAT gateway
+               + an EFS volume that persists the tsnet machine identity across restarts.
+
+    Database (both modes) via --database:
+      new       (default) provisions an RDS PostgreSQL with a generated master password.
+      existing  brings your own PostgreSQL; supply --db-host/--db-user/--db-name and
+                --db-password-secret-arn. No database is created.
     """
     confirm = true
 }
 
 properties {
+    // ── Shared ────────────────────────────────────────────────────────────────
+    // Access mode: "alb" (public HTTPS + basic auth) or "tailnet" (private, Tailscale).
+    access = new formae.Prop {
+        flag = "access"
+        default = "alb"
+    }
     name = new formae.Prop {
         flag = "name"
         default = vars.projectName
     }
     // --region/--aws-profile govern the LOCAL apply credentials (which build the infra),
-    // not the deployed agent (which authenticates via its ECS task role).
-    // NB: the flag is --aws-profile, not --profile, because formae reserves --profile
-    // for its own CLI profile (formae profile ...).
+    // not the deployed agent (which authenticates via its ECS task role). The flag is
+    // --aws-profile, not --profile, which formae reserves for its own CLI profiles.
     region = new formae.Prop {
         flag = "region"
         default = vars.region
@@ -69,24 +87,66 @@ properties {
         flag = "aws-profile"
         default = ""
     }
+    // ECS Fargate t-shirt size; maps to a Fargate-legal cpu/memory pair (see sizing.pkl).
+    size = new formae.Prop {
+        flag = "size"
+        default = "small"
+    }
     // "new" provisions an RDS database; "existing" points the agent at one you run.
     database = new formae.Prop {
         flag = "database"
         default = "new"
     }
-    // "public" = internet-facing ALB on 0.0.0.0/0 (laptop-reachable, plaintext HTTP);
-    // "internal" = internal ALB scoped to the VPC CIDR, no public task IPs (reach via VPN/peering).
-    visibility = new formae.Prop {
-        flag = "visibility"
-        default = "public"
+    // Full agent image reference — stock ghcr, an ECR mirror, or a custom image with extra
+    // plugins. Upgrade the agent by re-applying with a newer tag/ref (ECS rolls the task).
+    formaeImage = new formae.Prop {
+        flag = "formae-image"
+        default = vars.formaeImage
     }
-    // ECS Fargate t-shirt size; maps to a Fargate-legal cpu/memory pair (see fargateSizes).
-    size = new formae.Prop {
-        flag = "size"
-        default = "small"
+    // Basic-auth username for the agent API (both modes).
+    apiUser = new formae.Prop {
+        flag = "api-user"
+        default = "formae"
     }
-    // Existing-database connection (consumed only when --database=existing).
-    // host + password-secret-arn are required in that mode.
+    // Basic-auth password as a BCRYPT HASH (not plaintext), required in both modes.
+    // Generate locally: aws/scripts/gen-api-credential.sh (htpasswd -nbBC 10 "" <pw> | cut -d: -f2).
+    // Stored in an in-stack Secrets Manager secret and injected at task start.
+    apiPasswordHash = new formae.Prop {
+        flag = "api-password-hash"
+        default = ""
+    }
+
+    // ── alb mode ────────────────────────────────────────────────────────────────
+    // ARN of an ACM certificate (same region) for a domain you own. Required for --access alb.
+    certArn = new formae.Prop {
+        flag = "cert-arn"
+        default = ""
+    }
+    // The hostname clients connect to (must match the cert). Point its DNS at the ALB.
+    domain = new formae.Prop {
+        flag = "domain"
+        default = ""
+    }
+    // Optionally narrow ALB ingress to one CIDR (e.g. "203.0.113.4/32") instead of 0.0.0.0/0.
+    allowCidr = new formae.Prop {
+        flag = "allow-cidr"
+        default = ""
+    }
+
+    // ── tailnet mode ──────────────────────────────────────────────────────────────
+    // A reusable Tailscale auth key. Required for --access tailnet. Stored in an in-stack
+    // Secrets Manager secret and injected at task start; the agent joins the tailnet with it.
+    tsAuthkey = new formae.Prop {
+        flag = "ts-authkey"
+        default = ""
+    }
+    // The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
+    tsHostname = new formae.Prop {
+        flag = "ts-hostname"
+        default = ""
+    }
+
+    // ── existing-database connection (consumed only when --database=existing) ─────
     dbHost = new formae.Prop {
         flag = "db-host"
         default = ""
@@ -95,9 +155,6 @@ properties {
         flag = "db-port"
         default = "5432"
     }
-    // New mode defaults to the vars values (used for the DB we create); existing mode
-    // has no safe default (the value depends on your DB), so it defaults empty and is
-    // required (see dbUserExpr/dbNameExpr below).
     dbUser = new formae.Prop {
         flag = "db-user"
         default = ""
@@ -106,14 +163,13 @@ properties {
         flag = "db-name"
         default = ""
     }
-    // Secrets Manager ARN whose value is the DB password (or ARN + key selector,
-    // e.g. `...:secret:name:password::`, for a JSON secret).
     dbPasswordSecretArn = new formae.Prop {
         flag = "db-password-secret-arn"
         default = ""
     }
-    // VPC + subnet CIDRs. Subnets MUST sit within the VPC CIDR (AWS rejects mismatches);
-    // vpcCidr also scopes the internal-mode SG ingress, so keep it tight.
+
+    // ── VPC + subnet CIDRs ────────────────────────────────────────────────────────
+    // Subnets MUST sit within the VPC CIDR (AWS rejects mismatches).
     vpcCidr = new formae.Prop {
         flag = "vpc-cidr"
         default = vars.vpcCidr
@@ -126,11 +182,34 @@ properties {
         flag = "subnet-cidr-2"
         default = vars.subnetCidr2
     }
+    // Availability zones for the two subnets. Default to <region>a / <region>b, but some
+    // regions don't offer contiguous letters (e.g. us-west-1 has a + c, not b) — set these then.
+    az1 = new formae.Prop {
+        flag = "az-1"
+        default = ""
+    }
+    az2 = new formae.Prop {
+        flag = "az-2"
+        default = ""
+    }
 }
 
-local n = properties.name.value
+// Access mode, validated. Rejects flags that belong to the other mode so mistakes fail
+// fast with a clear message rather than being silently ignored.
+local access =
+    let (a = properties.access.value)
+        if (a != "alb" && a != "tailnet")
+            throw("--access must be \"alb\" or \"tailnet\" (got \"\(a)\")")
+        else if (a == "tailnet" && (properties.certArn.value != "" || properties.domain.value != "" || properties.allowCidr.value != ""))
+            throw("--cert-arn, --domain and --allow-cidr apply only to --access alb")
+        else if (a == "alb" && properties.tsAuthkey.value != "")
+            throw("--ts-authkey applies only to --access tailnet")
+        else a
+local isAlb = access == "alb"
+local isTailnet = access == "tailnet"
 local isNew = properties.database.value == "new"
-local isPublic = properties.visibility.value == "public"
+
+local n = properties.name.value
 
 // Validate CIDR shape early (clearer than a slow AWS round-trip). AWS still enforces
 // subnet-within-VPC containment, so an out-of-range subnet is caught at apply.
@@ -141,15 +220,33 @@ local function asCidr(value: String, flag: String): String =
 local vpcCidrVal = asCidr(properties.vpcCidr.value, "--vpc-cidr")
 local subnetCidr1Val = asCidr(properties.subnetCidr1.value, "--subnet-cidr-1")
 local subnetCidr2Val = asCidr(properties.subnetCidr2.value, "--subnet-cidr-2")
+local natSubnetCidrVal = asCidr(vars.natSubnetCidr, "natSubnetCidr")
 
-// Fargate-legal cpu/memory per t-shirt size (1 vCPU needs >=2GB, 2 vCPU >=4GB, 4 vCPU >=8GB).
-local fargateSizes = new Mapping {
-    ["small"] { cpu = "512"; memory = "1024" }
-    ["medium"] { cpu = "1024"; memory = "2048" }
-    ["large"] { cpu = "2048"; memory = "4096" }
-    ["xlarge"] { cpu = "4096"; memory = "8192" }
-}
-local taskSize = fargateSizes[properties.size.value]
+// Subnet AZs: explicit --az-1/--az-2 win, else derive <region>a / <region>b. Override for
+// regions with non-contiguous zones (us-west-1 offers a + c, not b).
+local az1 = if (properties.az1.value != "") properties.az1.value else "\(properties.region.value)a"
+local az2 = if (properties.az2.value != "") properties.az2.value else "\(properties.region.value)b"
+
+local taskSize = sizing.forSize(properties.size.value)
+
+// Required inputs. certArnVal / tsAuthkeyVal are referenced only inside their own mode, so
+// those throws fire only when that mode is selected; apiPasswordHashVal feeds the shared
+// apiSecret (basic-auth is on in both modes), so it is required regardless of --access.
+local certArnVal =
+    if (properties.certArn.value == "") throw("--cert-arn is required for --access alb (an ACM certificate ARN for your domain)")
+    else properties.certArn.value
+local apiPasswordHashVal =
+    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required (both modes). Generate it with aws/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash.value
+local tsAuthkeyVal =
+    if (properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
+    else properties.tsAuthkey.value
+local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+
+// ALB ingress CIDR: an explicit --allow-cidr wins, else open to all.
+local ingressCidr =
+    if (properties.allowCidr.value != "") asCidr(properties.allowCidr.value, "--allow-cidr")
+    else "0.0.0.0/0"
 
 // New mode resolves the host from the provisioned DB at runtime via $FORMAE_DB_HOST;
 // existing mode bakes the supplied host into the agent config at apply time.
@@ -157,9 +254,6 @@ local dbHostExpr =
     if (isNew) "$FORMAE_DB_HOST"
     else if (properties.dbHost.value == "") throw("--db-host is required when --database=existing")
     else properties.dbHost.value
-
-// New mode uses the vars values (for the DB we create); existing mode requires explicit
-// --db-user/--db-name rather than silently inheriting "formae" and connecting to the wrong DB.
 local dbUserExpr =
     if (isNew) vars.dbUser
     else if (properties.dbUser.value == "") throw("--db-user is required when --database=existing")
@@ -169,7 +263,151 @@ local dbNameExpr =
     else if (properties.dbName.value == "") throw("--db-name is required when --database=existing")
     else properties.dbName.value
 
-// Manifest of everything this stack deploys, in dependency order; definitions follow below.
+// Every bootstrap-tier resource carries Name + app=formae-agent; the latter lets the agent's
+// own discovery filter (emitted into the config below) suppress this stack's substrate.
+local function tagged(nm: String): Listing<aws.Tag> = new {
+    new { key = "Name"; value = nm }
+    new { key = "app"; value = "formae-agent" }
+}
+
+// The two subnets the agent + database live in, and the SG the agent task uses — both differ
+// by mode (alb: public subnets + ALB-fronted SG; tailnet: private subnets + no-ingress SG).
+local agentSubnet1 = if (isAlb) pubSubnet1 else privSubnet1
+local agentSubnet2 = if (isAlb) pubSubnet2 else privSubnet2
+local agentSg = if (isAlb) albTaskSg else tailnetAgentSg
+
+// ── Agent config file ───────────────────────────────────────────────────────────
+// Shared agent body: auth-basic (both modes) + server + datastore + background work +
+// discovery filter. Each mode wraps it — alb uses it as-is; tailnet adds a top-level
+// tailscale network block below.
+// The heredoc that writes this is unquoted, so $FORMAE_* expand from the injected ECS
+// secrets at write time; \(…) are Pkl interpolations resolved at apply.
+local agentBody = """
+  auth = new AuthBasic.AgentConfig {
+    authorizedUsers {
+      new AuthBasic.AuthorizedUser {
+        username = "\(properties.apiUser.value)"
+        password = "$FORMAE_API_PASSWORD_HASH"
+      }
+    }
+  }
+  server {
+    port = \(vars.formaePort)
+  }
+  datastore {
+    datastoreType = "postgres"
+    postgres {
+      host = "\(dbHostExpr)"
+      port = \(properties.dbPort.value)
+      user = "\(dbUserExpr)"
+      password = "$FORMAE_DB_PASSWORD"
+      database = "\(dbNameExpr)"
+      connectionParams = "sslmode=require"
+    }
+  }
+  synchronization {
+    enabled = true
+    interval = 300.s
+  }
+  discovery {
+    enabled = true
+    interval = 600.s
+  }
+  resourcePlugins {
+    new Aws.PluginConfig {
+      // Suppress this agent's own substrate (everything tagged app=formae-agent) from
+      // discovery, so it isn't surfaced as unmanaged drift. Multiple MatchFilters are OR'd;
+      // conditions within one are AND'd (a resource is excluded when any filter's conditions
+      // all match). Most AWS types carry tags at $.Tags — but EFS is special: FileSystem and
+      // AccessPoint expose tags under FileSystemTags / AccessPointTags, so a single $.Tags
+      // filter silently misses them and they leak. They get their own filters below.
+      // (EFS MountTargets are untaggable in AWS, so no tag filter can suppress them.)
+      discoveryFilters = new Listing {
+        new MatchFilter {
+          resourceTypes = new Listing {
+            "AWS::EC2::VPC"
+            "AWS::EC2::Subnet"
+            "AWS::EC2::InternetGateway"
+            "AWS::EC2::RouteTable"
+            "AWS::EC2::SecurityGroup"
+            "AWS::EC2::NatGateway"
+            "AWS::EC2::EIP"
+            "AWS::RDS::DBInstance"
+            "AWS::RDS::DBSubnetGroup"
+            "AWS::SecretsManager::Secret"
+            "AWS::ECS::Cluster"
+            "AWS::ECS::Service"
+            "AWS::ECS::TaskDefinition"
+            "AWS::IAM::Role"
+            "AWS::Logs::LogGroup"
+            "AWS::ElasticLoadBalancingV2::LoadBalancer"
+            "AWS::ElasticLoadBalancingV2::TargetGroup"
+          }
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.Tags[?(@.Key=='app')].Value"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+        new MatchFilter {
+          resourceTypes = new Listing { "AWS::EFS::FileSystem" }
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.FileSystemTags[?(@.Key=='app')].Value"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+        new MatchFilter {
+          resourceTypes = new Listing { "AWS::EFS::AccessPoint" }
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.AccessPointTags[?(@.Key=='app')].Value"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+      }
+    }
+  }
+"""
+
+local albConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Aws.pkl" as Aws
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+\(agentBody)}
+"""
+
+local tailnetConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Aws.pkl" as Aws
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+\(agentBody)}
+network = new NetworkConfig {
+  type = "tailscale"
+  tailscale = new TailscaleConfig {
+    tls = true
+    authKey = "$TAILSCALE_AUTHKEY"
+    hostname = "\(tsHostnameVal)"
+    advertiseTags { "tag:formae" }
+  }
+}
+"""
+
+local configScript = """
+mkdir -p /home/pel/.config/formae &&
+cat > /home/pel/.config/formae/formae.conf.pkl << PKLEOF
+\(if (isAlb) albConfig else tailnetConfig)
+PKLEOF
+exec formae agent start
+"""
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+// Everything this stack deploys, in dependency order; definitions follow below.
 forma {
     vars.stack
     new formae.Target {
@@ -180,16 +418,36 @@ forma {
         }
     }
 
-    // networking
+    // shared networking
     vpcRes
     igw
     igwAttach
-    subnet1
-    subnet2
-    rt
-    defaultRoute
-    rtAssoc1
-    rtAssoc2
+
+    // networking — alb: public subnets + IGW route
+    when (isAlb) {
+        pubSubnet1
+        pubSubnet2
+        albRt
+        albRoute
+        albRtAssoc1
+        albRtAssoc2
+    }
+
+    // networking — tailnet: private subnets + a public NAT subnet + NAT GW + dual route tables
+    when (isTailnet) {
+        privSubnet1
+        privSubnet2
+        natSubnet
+        natEip
+        natGw
+        pubRt
+        pubRoute
+        pubRtAssoc
+        privRt
+        privRoute
+        privRtAssoc1
+        privRtAssoc2
+    }
 
     // database (only when --database=new)
     when (isNew) {
@@ -200,39 +458,57 @@ forma {
         db
     }
 
-    // agent compute (ECS Fargate)
+    // shared compute
     taskExecRole
     taskRole
     logGrp
     ecsCluster
+    apiSecret
+
+    // credential/identity — tailnet adds a TS authkey secret + EFS for tsnet identity
+    when (isTailnet) {
+        tsAuthSecret
+        efsFs
+        efsSg
+        efsSgIngress
+        efsMt1
+        efsMt2
+        efsAp
+    }
+
     taskDef
 
-    // load balancer + service
-    albSg
-    albSgIngress
-    taskSg
-    taskSgIngress
-    alb
-    tg
-    serverCert
-    albListener
+    // ingress — alb: ALB + target group + HTTPS listener + SGs; tailnet: a no-ingress agent SG
+    when (isAlb) {
+        albSg
+        albSgIngress
+        albTaskSg
+        albTaskSgIngress
+        alb
+        tg
+        albListener
+    }
+    when (isTailnet) {
+        tailnetAgentSg
+    }
+
     ecsService
 }
 
-// Definitions, in the same order as the manifest above.
+// ── Definitions ─────────────────────────────────────────────────────────────────
 
-// networking
+// shared networking
 local vpcRes = new vpc.VPC {
     label = "\(n)-vpc"
     cidrBlock = vpcCidrVal
     enableDnsHostnames = true
     enableDnsSupport = true
-    tags { new { key = "Name"; value = "\(n)-vpc" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-vpc")
 }
 
 local igw = new internetgateway.InternetGateway {
     label = "\(n)-igw"
-    tags { new { key = "Name"; value = "\(n)-igw" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-igw")
 }
 
 local igwAttach = new vpcgatewayattachment.VPCGatewayAttachment {
@@ -241,55 +517,139 @@ local igwAttach = new vpcgatewayattachment.VPCGatewayAttachment {
     internetGatewayId = igw.res.id
 }
 
-local subnet1 = new subnet.Subnet {
+// ── Mode A (alb): public subnets, IGW route, no NAT ───────────────────────────────
+local pubSubnet1 = new subnet.Subnet {
     label = "\(n)-subnet-1"
     vpcId = vpcRes.res.id
     cidrBlock = subnetCidr1Val
-    availabilityZone = "\(properties.region.value)a"
+    availabilityZone = az1
     mapPublicIpOnLaunch = true
-    tags { new { key = "Name"; value = "\(n)-subnet-1" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-subnet-1")
 }
 
-local subnet2 = new subnet.Subnet {
+local pubSubnet2 = new subnet.Subnet {
     label = "\(n)-subnet-2"
     vpcId = vpcRes.res.id
     cidrBlock = subnetCidr2Val
-    availabilityZone = "\(properties.region.value)b"
+    availabilityZone = az2
     mapPublicIpOnLaunch = true
-    tags { new { key = "Name"; value = "\(n)-subnet-2" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-subnet-2")
 }
 
-local rt = new routetable.RouteTable {
+local albRt = new routetable.RouteTable {
     label = "\(n)-rt"
     vpcId = vpcRes.res.id
-    tags { new { key = "Name"; value = "\(n)-rt" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-rt")
 }
 
-local defaultRoute = new route.Route {
+local albRoute = new route.Route {
     label = "\(n)-route"
-    routeTableId = rt.res.id
+    routeTableId = albRt.res.id
     destinationCidrBlock = "0.0.0.0/0"
     gatewayId = igw.res.id
 }
 
-local rtAssoc1 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+local albRtAssoc1 = new subnetroutetableassociation.SubnetRouteTableAssociation {
     label = "\(n)-rt-assoc-1"
-    subnetId = subnet1.res.id
-    routeTableId = rt.res.id
+    subnetId = pubSubnet1.res.id
+    routeTableId = albRt.res.id
 }
 
-local rtAssoc2 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+local albRtAssoc2 = new subnetroutetableassociation.SubnetRouteTableAssociation {
     label = "\(n)-rt-assoc-2"
-    subnetId = subnet2.res.id
-    routeTableId = rt.res.id
+    subnetId = pubSubnet2.res.id
+    routeTableId = albRt.res.id
 }
 
-// database (only emitted when --database=new)
+// ── Mode B (tailnet): private subnets, public NAT subnet, NAT GW, dual route tables ──
+local privSubnet1 = new subnet.Subnet {
+    label = "\(n)-private-1"
+    vpcId = vpcRes.res.id
+    cidrBlock = subnetCidr1Val
+    availabilityZone = az1
+    tags = tagged("\(n)-private-1")
+}
+
+local privSubnet2 = new subnet.Subnet {
+    label = "\(n)-private-2"
+    vpcId = vpcRes.res.id
+    cidrBlock = subnetCidr2Val
+    availabilityZone = az2
+    tags = tagged("\(n)-private-2")
+}
+
+local natSubnet = new subnet.Subnet {
+    label = "\(n)-nat-public"
+    vpcId = vpcRes.res.id
+    cidrBlock = natSubnetCidrVal
+    availabilityZone = az1
+    mapPublicIpOnLaunch = true
+    tags = tagged("\(n)-nat-public")
+}
+
+local natEip = new eip.EIP {
+    label = "\(n)-nat-eip"
+    domain = "vpc"
+    tags = tagged("\(n)-nat-eip")
+}
+
+local natGw = new natgateway.NatGateway {
+    label = "\(n)-nat"
+    subnetId = natSubnet.res.subnetId
+    allocationId = natEip.res.allocationId
+    tags = tagged("\(n)-nat")
+}
+
+local pubRt = new routetable.RouteTable {
+    label = "\(n)-rt-public"
+    vpcId = vpcRes.res.id
+    tags = tagged("\(n)-rt-public")
+}
+
+local pubRoute = new route.Route {
+    label = "\(n)-route-public"
+    routeTableId = pubRt.res.id
+    destinationCidrBlock = "0.0.0.0/0"
+    gatewayId = igw.res.id
+}
+
+local pubRtAssoc = new subnetroutetableassociation.SubnetRouteTableAssociation {
+    label = "\(n)-rt-assoc-public"
+    subnetId = natSubnet.res.id
+    routeTableId = pubRt.res.id
+}
+
+local privRt = new routetable.RouteTable {
+    label = "\(n)-rt-private"
+    vpcId = vpcRes.res.id
+    tags = tagged("\(n)-rt-private")
+}
+
+local privRoute = new route.Route {
+    label = "\(n)-route-private"
+    routeTableId = privRt.res.id
+    destinationCidrBlock = "0.0.0.0/0"
+    natGatewayId = natGw.res.natGatewayId
+}
+
+local privRtAssoc1 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+    label = "\(n)-rt-assoc-private-1"
+    subnetId = privSubnet1.res.id
+    routeTableId = privRt.res.id
+}
+
+local privRtAssoc2 = new subnetroutetableassociation.SubnetRouteTableAssociation {
+    label = "\(n)-rt-assoc-private-2"
+    subnetId = privSubnet2.res.id
+    routeTableId = privRt.res.id
+}
+
+// ── Database (only emitted when --database=new) ───────────────────────────────────
 local dbSg = new securitygroup.SecurityGroup {
     label = "\(n)-db-sg"
     groupDescription = "Allow PostgreSQL from within the VPC (the ECS task)"
     vpcId = vpcRes.res.id
-    tags { new { key = "Name"; value = "\(n)-db-sg" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-db-sg")
 }
 
 local dbSgIngress = new securitygroupingress.SecurityGroupIngress {
@@ -304,8 +664,8 @@ local dbSgIngress = new securitygroupingress.SecurityGroupIngress {
 local dbSubnetGroup = new dbsubnetgroup.DBSubnetGroup {
     label = "\(n)-db-subnet-group"
     dbSubnetGroupDescription = "Subnet group for the formae database"
-    subnetIds { subnet1.res.subnetId; subnet2.res.subnetId }
-    tags { new { key = "Name"; value = "\(n)-db-subnet-group" }; new { key = "app"; value = "formae-agent" } }
+    subnetIds { agentSubnet1.res.subnetId; agentSubnet2.res.subnetId }
+    tags = tagged("\(n)-db-subnet-group")
 }
 
 local dbSecret = new secret.Secret {
@@ -313,7 +673,7 @@ local dbSecret = new secret.Secret {
     name = "\(n)-db-password"
     description = "formae database master password (generated)"
     secretString = formae.value(random.password(24, false)).opaque.setOnce
-    tags { new { key = "Name"; value = "\(n)-db-secret" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-db-secret")
 }
 
 local db = new dbinstance.DBInstance {
@@ -322,10 +682,12 @@ local db = new dbinstance.DBInstance {
     engine = "postgres"
     engineVersion = vars.dbEngineVersion
     dbInstanceClass = vars.dbInstanceClass
-    allocatedStorage = "20"
-    // Storage autoscaling ceiling. Multi-AZ is left off for a lean example default;
-    // enable multiAZ + raise this for production (see README).
-    maxAllocatedStorage = 100
+    // Storage as a typed DataSize; .toUnit("gib") normalizes to the GiB the schema expects,
+    // so the literal's unit can change safely.
+    allocatedStorage = 20.gib.toUnit("gib").value.toInt().toString()
+    // Storage autoscaling ceiling. Multi-AZ is off for a lean default; enable multiAZ +
+    // raise this for production (see README).
+    maxAllocatedStorage = 100.gib.toUnit("gib").value.toInt()
     dbName = dbNameExpr
     masterUsername = dbUserExpr
     masterUserPassword = dbSecret.res.secretString
@@ -334,10 +696,10 @@ local db = new dbinstance.DBInstance {
     storageEncrypted = true
     publiclyAccessible = false
     multiAZ = false
-    tags { new { key = "Name"; value = "\(n)-db" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-db")
 }
 
-// agent compute (ECS Fargate)
+// ── Shared compute (IAM, logs, cluster) ───────────────────────────────────────────
 local ecsAssumeRole = new Dynamic {
     ["Version"] = "2012-10-17"
     ["Statement"] = new Listing {
@@ -371,7 +733,7 @@ local taskExecRole = new role.Role {
             }
         }
     }
-    tags { new { key = "Name"; value = "\(n)-exec-role" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-exec-role")
 }
 
 // The agent's operating identity. PowerUserAccess excludes IAM, so the inline policy adds
@@ -464,99 +826,116 @@ local taskRole = new role.Role {
             }
         }
     }
-    tags { new { key = "Name"; value = "\(n)-task-role" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-task-role")
 }
 
 local logGrp = new loggroup.LogGroup {
     label = "\(n)-logs"
     logGroupName = "/ecs/\(n)"
     retentionInDays = 14
-    tags { new { key = "Name"; value = "\(n)-logs" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-logs")
 }
 
 local ecsCluster = new ecscluster.Cluster {
     label = "\(n)-ecs-cluster"
     clusterName = "\(n)-cluster"
-    tags { new { key = "Name"; value = "\(n)-cluster" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-cluster")
 }
 
-local configScript = new Listing {
-    "mkdir -p /home/pel/.config/formae &&"
-    "cat > /home/pel/.config/formae/formae.conf.pkl << PKLEOF"
-    "amends \"formae:/Config.pkl\""
-    "import \"plugins:/Aws.pkl\" as Aws"
-    "agent {"
-    "  server {"
-    "    port = \(vars.formaePort)"
-    "  }"
-    "  datastore {"
-    "    datastoreType = \"postgres\""
-    "    postgres {"
-    "      host = \"\(dbHostExpr)\""
-    "      port = \(properties.dbPort.value)"
-    "      user = \"\(dbUserExpr)\""
-    "      password = \"$FORMAE_DB_PASSWORD\""
-    "      database = \"\(dbNameExpr)\""
-    "      connectionParams = \"sslmode=require\""
-    "    }"
-    "  }"
-    "  synchronization {"
-    "    enabled = true"
-    "    interval = 300.s"
-    "  }"
-    "  discovery {"
-    "    enabled = true"
-    "    interval = 600.s"
-    "  }"
-    "  resourcePlugins {"
-    "    new Aws.PluginConfig {"
-    "      discoveryFilters = new Listing {"
-    "        new MatchFilter {"
-    "          resourceTypes = new Listing {"
-    "            \"AWS::EC2::VPC\""
-    "            \"AWS::EC2::Subnet\""
-    "            \"AWS::EC2::InternetGateway\""
-    "            \"AWS::EC2::RouteTable\""
-    "            \"AWS::EC2::SecurityGroup\""
-    "            \"AWS::RDS::DBInstance\""
-    "            \"AWS::RDS::DBSubnetGroup\""
-    "            \"AWS::SecretsManager::Secret\""
-    "            \"AWS::ECS::Cluster\""
-    "            \"AWS::ECS::Service\""
-    "            \"AWS::ECS::TaskDefinition\""
-    "            \"AWS::IAM::Role\""
-    "            \"AWS::Logs::LogGroup\""
-    "            \"AWS::ElasticLoadBalancingV2::LoadBalancer\""
-    "            \"AWS::ElasticLoadBalancingV2::TargetGroup\""
-    "          }"
-    "          conditions = new Listing {"
-    "            new FilterCondition {"
-    "              propertyPath = \"$.Tags[?(@.Key=='app')].Value\""
-    "              propertyValue = \"formae-agent\""
-    "            }"
-    "          }"
-    "        }"
-    "      }"
-    "    }"
-    "  }"
-    "}"
-    "PKLEOF"
-    "exec formae agent start"
-}.join("\n")
+// ── Mode A (alb): in-stack basic-auth credential secret ───────────────────────────
+// Holds the operator-supplied bcrypt hash; injected as $FORMAE_API_PASSWORD_HASH at task
+// start, never written into the task definition. Lifecycle tied to this stack.
+local apiSecret = new secret.Secret {
+    label = "\(n)-api-secret"
+    name = "\(n)-api-credential"
+    description = "formae agent API basic-auth bcrypt hash"
+    secretString = apiPasswordHashVal
+    tags = tagged("\(n)-api-secret")
+}
 
+// ── Mode B (tailnet): Tailscale auth key secret + EFS for tsnet identity ──────────
+local tsAuthSecret = new secret.Secret {
+    label = "\(n)-ts-secret"
+    name = "\(n)-ts-authkey"
+    description = "Tailscale auth key for the formae agent"
+    secretString = tsAuthkeyVal
+    tags = tagged("\(n)-ts-secret")
+}
+
+// EFS persists the agent's tsnet machine identity across task replacements (otherwise the
+// agent re-registers under a new tailnet hostname on every restart).
+local efsFs = new filesystem.FileSystem {
+    label = "\(n)-tsnet-efs"
+    encrypted = true
+    performanceMode = "generalPurpose"
+    throughputMode = "bursting"
+    fileSystemTags = tagged("\(n)-tsnet-efs")
+}
+
+local efsSg = new securitygroup.SecurityGroup {
+    label = "\(n)-efs-sg"
+    groupDescription = "Allow NFS from the formae agent task to the tsnet EFS"
+    vpcId = vpcRes.res.id
+    tags = tagged("\(n)-efs-sg")
+}
+
+local efsSgIngress = new securitygroupingress.SecurityGroupIngress {
+    label = "\(n)-efs-sg-ingress"
+    ipProtocol = "tcp"
+    fromPort = 2049
+    toPort = 2049
+    sourceSecurityGroupId = tailnetAgentSg.res.groupId
+    groupId = efsSg.res.groupId
+}
+
+local efsMt1 = new mounttarget.MountTarget {
+    label = "\(n)-efs-mt-1"
+    fileSystemId = efsFs.res.fileSystemId
+    subnetId = privSubnet1.res.subnetId
+    securityGroups { efsSg.res.groupId }
+}
+
+local efsMt2 = new mounttarget.MountTarget {
+    label = "\(n)-efs-mt-2"
+    fileSystemId = efsFs.res.fileSystemId
+    subnetId = privSubnet2.res.subnetId
+    securityGroups { efsSg.res.groupId }
+}
+
+// Access point pins the POSIX identity to pel (uid/gid 1001 in the published image) and
+// chroots into /tsnet, so the non-root container can own its identity directory.
+local efsAp = new accesspoint.AccessPoint {
+    label = "\(n)-efs-ap"
+    fileSystemId = efsFs.res.fileSystemId
+    posixUser = new {
+        uid = "1001"
+        gid = "1001"
+    }
+    rootDirectory = new {
+        path = "/tsnet"
+        creationInfo = new {
+            ownerUid = "1001"
+            ownerGid = "1001"
+            permissions = "0700"
+        }
+    }
+    accessPointTags = tagged("\(n)-efs-ap")
+}
+
+// ── Agent task + service ──────────────────────────────────────────────────────────
 local taskDef = new taskdefinition.TaskDefinition {
     label = "\(n)-task-def"
     family = "\(n)-task"
     requiresCompatibilities { "FARGATE" }
     networkMode = "awsvpc"
     cpu = taskSize.cpu
-    memory = taskSize.memory
+    memory = taskSize.memoryMib
     executionRoleArn = taskExecRole.res.arn
     taskRoleArn = taskRole.res.arn
     containerDefinitions {
         new taskdefinition.ContainerDefinition {
             name = "formae-agent"
-            image = vars.formaeImage
+            image = properties.formaeImage.value
             essential = true
             entryPoint { "sh"; "-c" }
             command { configScript }
@@ -566,8 +945,8 @@ local taskDef = new taskdefinition.TaskDefinition {
                     protocol = "tcp"
                 }
             }
-            // New mode injects the provisioned DB host as an env var; existing mode
-            // bakes the supplied host into the config script, so no host env var.
+            // New mode injects the provisioned DB host as an env var; existing mode bakes
+            // the supplied host into the config script, so no host env var.
             environment {
                 when (isNew) {
                     new taskdefinition.KeyValuePair {
@@ -576,8 +955,8 @@ local taskDef = new taskdefinition.TaskDefinition {
                     }
                 }
             }
-            // Password injected at runtime from Secrets Manager (never in the task def):
-            // new mode uses the in-stack Secret, existing mode the secret ARN you supply.
+            // Secrets injected at runtime from Secrets Manager (never in the task def): the
+            // DB password (both modes), plus the mode's credential.
             secrets {
                 new taskdefinition.Secret {
                     name = "FORMAE_DB_PASSWORD"
@@ -586,61 +965,95 @@ local taskDef = new taskdefinition.TaskDefinition {
                         else if (properties.dbPasswordSecretArn.value == "") throw("--db-password-secret-arn is required when --database=existing")
                         else properties.dbPasswordSecretArn.value
                 }
+                new taskdefinition.Secret {
+                    name = "FORMAE_API_PASSWORD_HASH"
+                    valueFrom = apiSecret.res.arn
+                }
+                when (isTailnet) {
+                    new taskdefinition.Secret {
+                        name = "TAILSCALE_AUTHKEY"
+                        valueFrom = tsAuthSecret.res.arn
+                    }
+                }
+            }
+            // tailnet mode: mount the EFS access point at the tsnet identity directory.
+            mountPoints {
+                when (isTailnet) {
+                    new taskdefinition.MountPoint {
+                        sourceVolume = "tsnet"
+                        containerPath = "/home/pel/.config/tsnet-formae"
+                    }
+                }
             }
             logConfiguration = new taskdefinition.LogConfiguration {
                 logDriver = "awslogs"
                 options {
                     ["awslogs-group"] = "/ecs/\(n)"
-                    ["awslogs-region"] = vars.region
+                    ["awslogs-region"] = properties.region.value
                     ["awslogs-stream-prefix"] = "formae"
                 }
             }
         }
     }
-    tags { new { key = "Name"; value = "\(n)-task-def" }; new { key = "app"; value = "formae-agent" } }
+    volumes {
+        when (isTailnet) {
+            new taskdefinition.Volume {
+                name = "tsnet"
+                eFSVolumeConfiguration = new {
+                    filesystemId = efsFs.res.fileSystemId
+                    transitEncryption = "ENABLED"
+                    authorizationConfig = new {
+                        accessPointId = efsAp.res.accessPointId
+                        iAM = "ENABLED"
+                    }
+                }
+            }
+        }
+    }
+    tags = tagged("\(n)-task-def")
 }
 
-// load balancer + service
+// ── Mode A (alb): ALB + target group + HTTPS listener + security groups ───────────
 local albSg = new securitygroup.SecurityGroup {
     label = "\(n)-alb-sg"
-    groupDescription = "Allow formae API traffic"
+    groupDescription = "Allow HTTPS to the formae API"
     vpcId = vpcRes.res.id
-    tags { new { key = "Name"; value = "\(n)-alb-sg" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-alb-sg")
 }
 
 local albSgIngress = new securitygroupingress.SecurityGroupIngress {
     label = "\(n)-alb-sg-ingress"
     ipProtocol = "tcp"
-    fromPort = vars.formaePort
-    toPort = vars.formaePort
-    cidrIp = if (isPublic) "0.0.0.0/0" else vpcCidrVal
+    fromPort = 443
+    toPort = 443
+    cidrIp = ingressCidr
     groupId = albSg.res.groupId
 }
 
-local taskSg = new securitygroup.SecurityGroup {
+local albTaskSg = new securitygroup.SecurityGroup {
     label = "\(n)-task-sg"
-    groupDescription = "Allow traffic from ALB to formae tasks"
+    groupDescription = "Allow traffic from the ALB to the formae task"
     vpcId = vpcRes.res.id
-    tags { new { key = "Name"; value = "\(n)-task-sg" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-task-sg")
 }
 
-local taskSgIngress = new securitygroupingress.SecurityGroupIngress {
+local albTaskSgIngress = new securitygroupingress.SecurityGroupIngress {
     label = "\(n)-task-sg-ingress"
     ipProtocol = "tcp"
     fromPort = vars.formaePort
     toPort = vars.formaePort
     sourceSecurityGroupId = albSg.res.groupId
-    groupId = taskSg.res.groupId
+    groupId = albTaskSg.res.groupId
 }
 
 local alb = new loadbalancer.LoadBalancer {
     label = "\(n)-alb"
     name = "\(n)-alb"
-    subnets { subnet1.res.subnetId; subnet2.res.subnetId }
+    subnets { pubSubnet1.res.subnetId; pubSubnet2.res.subnetId }
     securityGroups { albSg.res.groupId }
-    scheme = if (isPublic) "internet-facing" else "internal"
+    scheme = "internet-facing"
     type = "application"
-    tags { new { key = "Name"; value = "\(n)-alb" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-alb")
 }
 
 local tg = new targetgroup.TargetGroup {
@@ -656,27 +1069,20 @@ local tg = new targetgroup.TargetGroup {
     healthCheckPort = "\(vars.formaePort)"
     matcher = new targetgroup.Matcher { httpCode = "200" }
     healthCheckIntervalSeconds = 30
-    tags { new { key = "Name"; value = "\(n)-tg" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-tg")
 }
 
-// Self-signed cert for the ALB's HTTPS listener. The PEM is generated locally with
-// openssl (see README) and read in at eval time; cert.crt/cert.key are gitignored.
-local serverCert = new servercertificate.ServerCertificate {
-    label = "\(n)-cert"
-    serverCertificateName = "\(n)-cert"
-    certificateBody = read("./cert.crt").text
-    privateKey = read("./cert.key").text
-    tags { new { key = "Name"; value = "\(n)-cert" }; new { key = "app"; value = "formae-agent" } }
-}
-
+// HTTPS listener terminating TLS with the operator's ACM cert. The agent speaks HTTP behind
+// it; the ALB health check hits /api/v1/health, which auth-basic exempts, so targets stay
+// healthy. Connect via https://<your-domain> (the cert must match that hostname).
 local albListener = new listener.Listener {
     label = "\(n)-listener"
     loadBalancerArn = alb.res.loadBalancerArn
-    port = vars.formaePort
+    port = 443
     protocol = "HTTPS"
     sslPolicy = "ELBSecurityPolicy-TLS13-1-2-2021-06"
     certificates {
-        new listener.Certificate { certificateArn = serverCert.res.arn }
+        new listener.Certificate { certificateArn = certArnVal }
     }
     defaultActions {
         new listener.Action {
@@ -686,6 +1092,15 @@ local albListener = new listener.Listener {
     }
 }
 
+// ── Mode B (tailnet): the agent task SG (no ingress — reached over the tailnet) ───
+local tailnetAgentSg = new securitygroup.SecurityGroup {
+    label = "\(n)-agent-sg"
+    groupDescription = "formae agent task - no ingress, default egress, reached via Tailscale"
+    vpcId = vpcRes.res.id
+    tags = tagged("\(n)-agent-sg")
+}
+
+// ── Service (shared; networking + load balancer wiring differ by mode) ────────────
 local ecsService = new service.Service {
     label = "\(n)-ecs-service"
     serviceName = "\(n)-service"
@@ -697,19 +1112,33 @@ local ecsService = new service.Service {
     desiredCount = 1
     launchType = "FARGATE"
     enableExecuteCommand = true
+    // Fail a bad rollout fast (and roll back to the last good task def) instead of retrying
+    // a broken task forever and hanging the apply.
+    deploymentConfiguration = new service.DeploymentConfiguration {
+        maximumPercent = 200
+        minimumHealthyPercent = 100
+        deploymentCircuitBreaker = new service.DeploymentCircuitBreaker {
+            enable = true
+            rollback = true
+        }
+    }
     networkConfiguration = new service.NetworkConfiguration {
         awsvpcConfiguration = new service.AwsVpcConfiguration {
-            assignPublicIp = if (isPublic) "ENABLED" else "DISABLED"
-            subnets { subnet1.res.subnetId; subnet2.res.subnetId }
-            securityGroups { taskSg.res.groupId }
+            // alb: public subnets + public IP for egress; tailnet: private subnets, no public IP.
+            assignPublicIp = if (isAlb) "ENABLED" else "DISABLED"
+            subnets { agentSubnet1.res.subnetId; agentSubnet2.res.subnetId }
+            securityGroups { agentSg.res.groupId }
         }
     }
+    // alb mode registers with the target group; tailnet mode has no load balancer.
     loadBalancers {
-        new service.LoadBalancer {
-            targetGroupArn = tg.res.targetGroupArn
-            containerName = "formae-agent"
-            containerPort = vars.formaePort
+        when (isAlb) {
+            new service.LoadBalancer {
+                targetGroupArn = tg.res.targetGroupArn
+                containerName = "formae-agent"
+                containerPort = vars.formaePort
+            }
         }
     }
-    tags { new { key = "Name"; value = "\(n)-service" }; new { key = "app"; value = "formae-agent" } }
+    tags = tagged("\(n)-service")
 }
