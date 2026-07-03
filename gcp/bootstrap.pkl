@@ -1,0 +1,495 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+amends "@formae/forma.pkl"
+import "@formae/formae.pkl"
+import "@gcp/gcp.pkl"
+
+import "@gcp/compute/network.pkl"
+import "@gcp/compute/subnetwork.pkl"
+import "@gcp/compute/router.pkl"
+import "@gcp/compute/routerNat.pkl"
+import "@gcp/compute/disk.pkl"
+import "@gcp/compute/instance.pkl"
+
+import "@gcp/sql/database.pkl"
+import "@gcp/secretmanager/secret.pkl"
+import "@gcp/secretmanager/secretVersion.pkl"
+import "@gcp/iam/serviceAccount.pkl"
+import "@gcp/iam/projectIamMember.pkl"
+
+import "./vars.pkl"
+import "./sizing.pkl"
+
+description {
+    text = """
+    Formae agent on GCP - the "install formae into a production environment" example.
+    A long-running GCE VM (the analog of the AWS ECS Fargate task) runs the agent
+    container, reached privately over your Tailscale tailnet (no public ingress),
+    serving a trusted *.ts.net certificate with HTTP basic auth on top. Mirrors the
+    AWS `tailnet` mode: a private subnet + Cloud NAT for egress + a persistent disk
+    that keeps the tsnet machine identity across VM replacements.
+
+    Cloud SQL Postgres backs the agent, reached through the Cloud SQL Auth Proxy
+    (started alongside the agent on the VM) using the VM service account
+    (roles/cloudsql.client) - no VPC private-service-access needed.
+
+    Secrets (DB password, API basic-auth bcrypt hash, Tailscale auth key) live in
+    Secret Manager and are fetched by the VM at boot via its metadata token; they
+    are never placed in instance metadata.
+
+    Public HTTPS mode (the AWS `alb` equivalent) is not yet offered: a GCE-VM-backed
+    external HTTPS load balancer needs instance-group membership management, which
+    the GCP plugin does not implement yet.
+    """
+    confirm = true
+}
+
+properties {
+    // GCP project the agent's infrastructure lives in. Required.
+    project = new formae.Prop {
+        flag = "project"
+        default = vars.project
+    }
+    name = new formae.Prop {
+        flag = "name"
+        default = vars.projectName
+    }
+    region = new formae.Prop {
+        flag = "region"
+        default = vars.region
+    }
+    zone = new formae.Prop {
+        flag = "zone"
+        default = vars.zone
+    }
+    // GCE t-shirt size; maps to a machine type (see sizing.pkl).
+    size = new formae.Prop {
+        flag = "size"
+        default = "small"
+    }
+    // Full agent image reference. Upgrade the agent by re-applying with a newer tag.
+    formaeImage = new formae.Prop {
+        flag = "formae-image"
+        default = vars.formaeImage
+    }
+    // Basic-auth username for the agent API.
+    apiUser = new formae.Prop {
+        flag = "api-user"
+        default = "formae"
+    }
+    // Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
+    // gcp/scripts/gen-api-credential.sh. Stored in a Secret Manager SecretVersion.
+    apiPasswordHash = new formae.Prop {
+        flag = "api-password-hash"
+        default = ""
+    }
+    // Cloud SQL postgres-user password. Supplied (not generated in-forma) so the
+    // value is stable across applies; gen-api-credential.sh prints one.
+    dbPassword = new formae.Prop {
+        flag = "db-password"
+        default = ""
+    }
+    // A reusable Tailscale auth key (tagged tag:formae). Stored in Secret Manager;
+    // the agent joins the tailnet with it.
+    tsAuthkey = new formae.Prop {
+        flag = "ts-authkey"
+        default = ""
+    }
+    // The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
+    tsHostname = new formae.Prop {
+        flag = "ts-hostname"
+        default = ""
+    }
+    subnetCidr = new formae.Prop {
+        flag = "subnet-cidr"
+        default = vars.subnetCidr
+    }
+}
+
+// ── Required inputs ───────────────────────────────────────────────────────────
+local projectVal =
+    if (properties.project.value == "") throw("--project is required (the GCP project ID)")
+    else properties.project.value
+local apiPasswordHashVal =
+    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required. Generate it with gcp/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash.value
+local dbPasswordVal =
+    if (properties.dbPassword.value == "") throw("--db-password is required (a stable Cloud SQL postgres password; gen-api-credential.sh prints one)")
+    else properties.dbPassword.value
+local tsAuthkeyVal =
+    if (properties.tsAuthkey.value == "") throw("--ts-authkey is required (a reusable Tailscale auth key)")
+    else properties.tsAuthkey.value
+
+local n = properties.name.value
+local regionVal = properties.region.value
+local zoneVal = properties.zone.value
+local machineTypeVal = sizing.forSize(properties.size.value)
+local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+// Cloud SQL connection name is deterministic: project:region:instance.
+local dbInstanceName = "\(n)-db"
+local dbConnName = "\(projectVal):\(regionVal):\(dbInstanceName)"
+
+// Every bootstrap-tier resource carries the app=formae-agent label so the agent's
+// own discovery filter (emitted into the config below) can suppress this stack's
+// substrate rather than surfacing it as unmanaged drift.
+local commonLabels: Mapping<String, String> = new {
+    ["app"] = "formae-agent"
+}
+
+// ── Agent config file (written on the VM by the startup script) ───────────────
+// tailnet mode: auth-basic + server + postgres datastore (via the local Cloud SQL
+// Auth Proxy on 127.0.0.1:5432) + background work + a top-level tailscale network
+// block. $FORMAE_* / $TAILSCALE_AUTHKEY expand from the env the startup script
+// exports (fetched from Secret Manager); \(…) are Pkl interpolations at apply.
+local agentConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Gcp.pkl" as Gcp
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+  auth = new AuthBasic.AgentConfig {
+    authorizedUsers {
+      new AuthBasic.AuthorizedUser {
+        username = "\(properties.apiUser.value)"
+        password = "$FORMAE_API_PASSWORD_HASH"
+      }
+    }
+  }
+  server {
+    port = \(vars.formaePort)
+  }
+  datastore {
+    datastoreType = "postgres"
+    postgres {
+      host = "127.0.0.1"
+      port = 5432
+      user = "\(vars.dbUser)"
+      password = "$FORMAE_DB_PASSWORD"
+      database = "\(vars.dbName)"
+      connectionParams = "sslmode=disable"
+    }
+  }
+  synchronization {
+    enabled = true
+    interval = 300.s
+  }
+  discovery {
+    enabled = true
+    interval = 600.s
+  }
+  resourcePlugins {
+    new Gcp.PluginConfig {
+      // Suppress this agent's own substrate (everything labeled app=formae-agent)
+      // from discovery so it is not surfaced as unmanaged drift. NOTE: the exact
+      // GCP label filter path is provider-specific and must be validated against a
+      // live discovery run; adjust the propertyPath if the substrate still leaks.
+      discoveryFilters = new Listing {
+        new MatchFilter {
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.labels.app"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+network = new NetworkConfig {
+  type = "tailscale"
+  tailscale = new TailscaleConfig {
+    tls = true
+    authKey = "$TAILSCALE_AUTHKEY"
+    hostname = "\(tsHostnameVal)"
+    advertiseTags { "tag:formae" }
+  }
+}
+"""
+
+// ── VM startup script (Container-Optimized OS) ────────────────────────────────
+// Fetches secrets via the metadata access token (no gcloud on COS), mounts the
+// tsnet identity disk, starts the Cloud SQL Auth Proxy, writes the agent config,
+// and starts the agent container joined to the tailnet.
+//
+// NOTE: this runtime path (COS + docker + proxy + tsnet identity on a mounted
+// disk) is best-effort and must be validated with a real `formae apply`; the JSON
+// parsing is sed-based to avoid depending on jq/python being present on COS.
+local startupScript = """
+#!/bin/bash
+set -euo pipefail
+PROJECT="\(projectVal)"
+META="http://metadata.google.internal/computeMetadata/v1"
+mdcurl() { curl -s -H "Metadata-Flavor: Google" "$@"; }
+
+# Access token for the VM service account.
+TOKEN=$(mdcurl "$META/instance/service-accounts/default/token" | sed -n 's/.*"access_token":"\\([^"]*\\)".*/\\1/p')
+getsecret() {
+  curl -s -H "Authorization: Bearer $TOKEN" \\
+    "https://secretmanager.googleapis.com/v1/projects/$PROJECT/secrets/$1/versions/latest:access" \\
+    | sed -n 's/.*"data":"\\([^"]*\\)".*/\\1/p' | base64 -d
+}
+export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
+export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
+export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
+
+# Persistent tsnet identity disk is the second attached disk. Format on first use.
+TSDEV=/dev/disk/by-id/google-tsnet
+if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
+mkdir -p /mnt/tsnet && mount "$TSDEV" /mnt/tsnet
+
+# Cloud SQL Auth Proxy: listens on 127.0.0.1:5432, authenticates via the VM SA.
+docker run -d --restart always --name cloudsql-proxy --network host \\
+  gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest \\
+  --address 0.0.0.0 --port 5432 "\(dbConnName)"
+
+# Agent config, then the agent container (joins the tailnet, persists identity).
+mkdir -p /var/formae
+cat > /var/formae/formae.conf.pkl << 'PKLEOF'
+\(agentConfig)
+PKLEOF
+
+docker run -d --restart always --name formae-agent --network host \\
+  -v /mnt/tsnet:/home/pel/.config/tsnet-formae \\
+  -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
+  -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH -e TAILSCALE_AUTHKEY \\
+  "\(properties.formaeImage.value)" \\
+  formae agent start
+"""
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+forma {
+    vars.stack
+    new formae.Target {
+        label = "bootstrap-target"
+        config = new gcp.Config {
+            project = projectVal
+            region = regionVal
+            zone = zoneVal
+        }
+    }
+
+    // networking
+    vpcNetwork
+    subnet
+    natRouter
+    nat
+
+    // identity + access
+    agentSa
+    saCloudSql
+    saSecrets
+    saEditor
+    saIamAdmin
+
+    // database + secrets
+    db
+    dbSecret
+    dbSecretVersion
+    apiSecret
+    apiSecretVersion
+    tsSecret
+    tsSecretVersion
+
+    // compute
+    tsnetDisk
+    bootDisk
+    agentVm
+}
+
+// ── Networking ──────────────────────────────────────────────────────────────
+local vpcNetwork = new network.Network {
+    label = "\(n)-vpc"
+    name = "\(n)-vpc"
+    autoCreateSubnetworks = false
+}
+
+local subnet = new subnetwork.Subnetwork {
+    label = "\(n)-subnet"
+    name = "\(n)-subnet"
+    network = vpcNetwork.res.selfLink
+    region = regionVal
+    ipCidrRange = properties.subnetCidr.value
+    // Lets the VM reach Google APIs (Secret Manager, Cloud SQL) without a public IP.
+    privateIpGoogleAccess = true
+}
+
+local natRouter = new router.Router {
+    label = "\(n)-router"
+    name = "\(n)-router"
+    network = vpcNetwork.res.selfLink
+    region = regionVal
+}
+
+local nat = new routerNat.RouterNat {
+    label = "\(n)-nat"
+    name = "\(n)-nat"
+    router = natRouter.res.selfLink
+    region = regionVal
+    natIpAllocateOption = "AUTO_ONLY"
+    sourceSubnetworkIpRangesToNat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
+// ── Identity + access ─────────────────────────────────────────────────────────
+local agentSa = new serviceAccount.ServiceAccount {
+    label = "\(n)-sa"
+    name = "\(n)-agent"
+    displayName = "Formae agent (\(n))"
+    description = "Runtime identity for the formae agent VM"
+}
+
+// The SA email is deterministic from its accountId + project. The instance and
+// IAM-member fields are typed String (not Resolvable), so it is built as a
+// literal rather than read from agentSa.res.email.
+local saEmail = "\(n)-agent@\(projectVal).iam.gserviceaccount.com"
+local saMember = "serviceAccount:\(saEmail)"
+
+// Reach Cloud SQL through the Auth Proxy.
+local saCloudSql = new projectIamMember.ProjectIamMember {
+    label = "\(n)-iam-cloudsql"
+    project = projectVal
+    role = "roles/cloudsql.client"
+    member = saMember
+}
+// Read the DB password / API hash / TS authkey secrets at boot.
+local saSecrets = new projectIamMember.ProjectIamMember {
+    label = "\(n)-iam-secrets"
+    project = projectVal
+    role = "roles/secretmanager.secretAccessor"
+    member = saMember
+}
+// The agent's operating identity for managing GCP infrastructure. roles/editor is
+// broad but excludes IAM policy management; the IAM admin binding below adds it.
+// Tighten these for production (see README).
+local saEditor = new projectIamMember.ProjectIamMember {
+    label = "\(n)-iam-editor"
+    project = projectVal
+    role = "roles/editor"
+    member = saMember
+}
+local saIamAdmin = new projectIamMember.ProjectIamMember {
+    label = "\(n)-iam-admin"
+    project = projectVal
+    role = "roles/resourcemanager.projectIamAdmin"
+    member = saMember
+}
+
+// ── Database ────────────────────────────────────────────────────────────────
+local db = new database.DatabaseInstance {
+    label = "\(n)-db"
+    project = projectVal
+    name = dbInstanceName
+    databaseVersion = vars.dbVersion
+    region = regionVal
+    // Set once at creation; the agent fetches the same value from Secret Manager.
+    rootPassword = dbPasswordVal
+    settings = new database.Settings {
+        tier = vars.dbTier
+        // Public IP enabled but no authorized networks: only reachable via the
+        // Cloud SQL Auth Proxy, which authenticates with the VM service account.
+        ipConfiguration = new database.IpConfiguration {
+            ipv4Enabled = true
+        }
+    }
+}
+
+// ── Secrets ─────────────────────────────────────────────────────────────────
+local dbSecret = new secret.Secret {
+    label = "\(n)-db-secret"
+    name = "\(n)-db-password"
+    labels = commonLabels
+}
+local dbSecretVersion = new secretVersion.SecretVersion {
+    label = "\(n)-db-secret-version"
+    secret = dbSecret.res.name
+    data = dbPasswordVal
+}
+
+local apiSecret = new secret.Secret {
+    label = "\(n)-api-secret"
+    name = "\(n)-api-credential"
+    labels = commonLabels
+}
+local apiSecretVersion = new secretVersion.SecretVersion {
+    label = "\(n)-api-secret-version"
+    secret = apiSecret.res.name
+    data = apiPasswordHashVal
+}
+
+local tsSecret = new secret.Secret {
+    label = "\(n)-ts-secret"
+    name = "\(n)-ts-authkey"
+    labels = commonLabels
+}
+local tsSecretVersion = new secretVersion.SecretVersion {
+    label = "\(n)-ts-secret-version"
+    secret = tsSecret.res.name
+    data = tsAuthkeyVal
+}
+
+// ── Compute ─────────────────────────────────────────────────────────────────
+// Persistent identity disk (EFS analog): survives VM replacement so the agent
+// keeps its tsnet machine identity (autoDelete=false on the attachment).
+local tsnetDisk = new disk.Disk {
+    label = "\(n)-tsnet-disk"
+    project = projectVal
+    zone = zoneVal
+    name = "\(n)-tsnet"
+    sizeGb = vars.tsnetDiskSizeGb
+    type = "pd-balanced"
+    labels = commonLabels
+}
+
+local bootDisk = new disk.Disk {
+    label = "\(n)-boot-disk"
+    project = projectVal
+    zone = zoneVal
+    name = "\(n)-boot"
+    sizeGb = vars.bootDiskSizeGb
+    type = "pd-balanced"
+    sourceImage = vars.bootImage
+    labels = commonLabels
+}
+
+local agentVm = new instance.Instance {
+    label = "\(n)-vm"
+    project = projectVal
+    zone = zoneVal
+    name = "\(n)-agent"
+    machineType = machineTypeVal
+    labels = commonLabels
+    disks {
+        new instance.AttachedDisk {
+            boot = true
+            source = bootDisk.res.selfLink
+            autoDelete = true
+        }
+        new instance.AttachedDisk {
+            source = tsnetDisk.res.selfLink
+            autoDelete = false
+            mode = "READ_WRITE"
+        }
+    }
+    networkInterfaces {
+        // No accessConfigs => no external IP. Egress via Cloud NAT; reached over
+        // the tailnet.
+        new instance.NetworkInterface {
+            network = vpcNetwork.res.selfLink
+            subnetwork = subnet.res.selfLink
+        }
+    }
+    serviceAccounts {
+        new instance.ServiceAccount {
+            email = saEmail
+            scopes { "https://www.googleapis.com/auth/cloud-platform" }
+        }
+    }
+    metadata = new instance.Metadata {
+        items {
+            ["startup-script"] = startupScript
+        }
+    }
+}
