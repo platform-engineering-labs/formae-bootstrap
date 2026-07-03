@@ -387,6 +387,9 @@ local db = new database.DatabaseInstance {
     // Set once at creation; the agent fetches the same value from Secret Manager.
     rootPassword = dbPasswordVal
     settings = new database.Settings {
+        // ENTERPRISE edition accepts db-custom-* tiers; the project's default
+        // (ENTERPRISE_PLUS) only allows db-perf-optimized-* tiers.
+        edition = "ENTERPRISE"
         tier = vars.dbTier
         // Public IP enabled but no authorized networks: only reachable via the
         // Cloud SQL Auth Proxy, which authenticates with the VM service account.
@@ -470,7 +473,6 @@ local agentVm = new instance.Instance {
         new instance.AttachedDisk {
             source = tsnetDisk.res.selfLink
             autoDelete = false
-            mode = "READ_WRITE"
         }
     }
     networkInterfaces {

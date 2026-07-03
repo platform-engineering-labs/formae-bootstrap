@@ -112,8 +112,22 @@ formae apply --mode destroy gcp/destroy-target.pkl
 
 ## Validation status
 
-The forma evaluates cleanly (`pkl eval`) and uses only merged, conformance-tested plugin
-resources. The **VM runtime path** — the Container-Optimized OS startup script that
-fetches secrets, mounts the tsnet identity disk, starts the Cloud SQL Auth Proxy, and
-launches the agent container on the tailnet — has not yet been exercised by a live
-`formae apply` end-to-end; treat it as needing a first real apply to shake out.
+`pkl eval` and `formae apply --simulate` are clean. A live apply created 15/19 resources
+including the running VM (network, NAT, disks, secrets, service account, IAM bindings all
+succeeded, in correct dependency order). Two blockers stop a full end-to-end run in the
+test environment; both are plugin/environment issues, not the forma:
+
+1. **Cloud SQL.** The test org enforces `constraints/sql.restrictPublicIp`, which rejects
+   the public-IP + Auth-Proxy approach. The private-IP alternative needs Private Service
+   Access (a `servicenetworking` VPC-peering connection), which the GCP plugin does not
+   implement yet. Until the plugin supports PSA (or the org allows public IP), point the
+   agent at an **existing** database instead.
+2. **Re-apply idempotency.** network/subnetwork/disk references don't round-trip on read
+   (`.res.selfLink` renders a full `https://…` URL but GCP stores the `projects/…` path;
+   a boot-disk `sourceImage` *family* resolves to a specific image), so reconcile computes
+   spurious **replaces** of the subnet + boot disk, which fail while the VM is using them.
+   A plugin read-normalization fix is needed for clean upgrades.
+
+The **VM runtime path** (COS startup script: secret fetch, tsnet disk mount, Cloud SQL
+proxy, agent container on the tailnet) was not reached end-to-end because the DB never
+came up; it still needs a first real run once the Cloud SQL blocker is resolved.
