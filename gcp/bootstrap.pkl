@@ -14,6 +14,8 @@ import "@gcp/compute/router.pkl"
 import "@gcp/compute/routerNat.pkl"
 import "@gcp/compute/disk.pkl"
 import "@gcp/compute/instance.pkl"
+import "@gcp/compute/globalAddress.pkl"
+import "@gcp/servicenetworking/connection.pkl"
 
 import "@gcp/sql/database.pkl"
 import "@gcp/secretmanager/secret.pkl"
@@ -33,9 +35,11 @@ description {
     AWS `tailnet` mode: a private subnet + Cloud NAT for egress + a persistent disk
     that keeps the tsnet machine identity across VM replacements.
 
-    Cloud SQL Postgres backs the agent, reached through the Cloud SQL Auth Proxy
-    (started alongside the agent on the VM) using the VM service account
-    (roles/cloudsql.client) - no VPC private-service-access needed.
+    Cloud SQL Postgres (private IP) backs the agent, reached through the Cloud SQL
+    Auth Proxy (started alongside the agent on the VM, --private-ip) using the VM
+    service account (roles/cloudsql.client). A Private Service Access peering
+    (globalAddress + servicenetworking connection) gives the instance its private
+    IP, since the org policy constraints/sql.restrictPublicIp forbids public IPs.
 
     Secrets (DB password, API basic-auth bcrypt hash, Tailscale auth key) live in
     Secret Manager and are fetched by the VM at boot via its metadata token; they
@@ -236,15 +240,19 @@ export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
 export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
 export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
 
-# Persistent tsnet identity disk is the second attached disk. Format on first use.
+# Persistent tsnet identity disk (deviceName=tsnet). Wait for the by-id symlink
+# to appear (udev races the startup script), then format on first use.
 TSDEV=/dev/disk/by-id/google-tsnet
+for i in $(seq 1 30); do [ -b "$TSDEV" ] && break; sleep 2; done
 if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
-mkdir -p /mnt/tsnet && mount "$TSDEV" /mnt/tsnet
+# COS has a read-only root (/mnt is not writable); /var is the stateful mount.
+mkdir -p /var/lib/tsnet && mount "$TSDEV" /var/lib/tsnet
 
 # Cloud SQL Auth Proxy: listens on 127.0.0.1:5432, authenticates via the VM SA.
+# --private-ip dials the instance's private IP over the VPC (no public IP exists).
 docker run -d --restart always --name cloudsql-proxy --network host \\
   gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest \\
-  --address 0.0.0.0 --port 5432 "\(dbConnName)"
+  --address 0.0.0.0 --port 5432 --private-ip "\(dbConnName)"
 
 # Agent config, then the agent container (joins the tailnet, persists identity).
 mkdir -p /var/formae
@@ -253,7 +261,7 @@ cat > /var/formae/formae.conf.pkl << 'PKLEOF'
 PKLEOF
 
 docker run -d --restart always --name formae-agent --network host \\
-  -v /mnt/tsnet:/home/pel/.config/tsnet-formae \\
+  -v /var/lib/tsnet:/home/pel/.config/tsnet-formae \\
   -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
   -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH -e TAILSCALE_AUTHKEY \\
   "\(properties.formaeImage.value)" \\
@@ -277,6 +285,8 @@ forma {
     subnet
     natRouter
     nat
+    psaRange
+    psaConn
 
     // identity + access
     agentSa
@@ -331,6 +341,26 @@ local nat = new routerNat.RouterNat {
     region = regionVal
     natIpAllocateOption = "AUTO_ONLY"
     sourceSubnetworkIpRangesToNat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+}
+
+// ── Private Service Access ────────────────────────────────────────────────────
+// Reserve a peering range and establish the VPC peering to Google's service
+// producer network, so Cloud SQL can be reached on a private IP (the org policy
+// constraints/sql.restrictPublicIp forbids public IPs). GCP auto-picks the
+// range within the block from the given prefix length.
+local psaRange = new globalAddress.GlobalAddress {
+    label = "\(n)-psa-range"
+    name = "\(n)-psa-range"
+    addressType = "INTERNAL"
+    purpose = "VPC_PEERING"
+    prefixLength = 16
+    network = vpcNetwork.res.selfLink
+}
+
+local psaConn = new connection.Connection {
+    label = "\(n)-psa-connection"
+    network = vpcNetwork.res.selfLink
+    reservedPeeringRanges = new Listing { psaRange.res.name }
 }
 
 // ── Identity + access ─────────────────────────────────────────────────────────
@@ -391,10 +421,12 @@ local db = new database.DatabaseInstance {
         // (ENTERPRISE_PLUS) only allows db-perf-optimized-* tiers.
         edition = "ENTERPRISE"
         tier = vars.dbTier
-        // Public IP enabled but no authorized networks: only reachable via the
-        // Cloud SQL Auth Proxy, which authenticates with the VM service account.
+        // Private IP only (public IP is forbidden by constraints/sql.restrictPublicIp).
+        // privateNetwork references the PSA connection's resolvable so the instance
+        // is created only after the VPC peering exists.
         ipConfiguration = new database.IpConfiguration {
-            ipv4Enabled = true
+            ipv4Enabled = false
+            privateNetwork = psaConn.res.network
         }
     }
 }
@@ -473,6 +505,9 @@ local agentVm = new instance.Instance {
         new instance.AttachedDisk {
             source = tsnetDisk.res.selfLink
             autoDelete = false
+            // Stable device name => /dev/disk/by-id/google-tsnet, which the
+            // startup script formats/mounts for the persistent tsnet identity.
+            deviceName = "tsnet"
         }
     }
     networkInterfaces {
