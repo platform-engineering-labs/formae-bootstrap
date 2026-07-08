@@ -232,13 +232,23 @@ mdcurl() { curl -s -H "Metadata-Flavor: Google" "$@"; }
 # Access token for the VM service account.
 TOKEN=$(mdcurl "$META/instance/service-accounts/default/token" | sed -n 's/.*"access_token":"\\([^"]*\\)".*/\\1/p')
 getsecret() {
+  # Secret Manager returns pretty-printed JSON: "data": "<base64>" (note the
+  # space after the colon), so the pattern must tolerate whitespace.
   curl -s -H "Authorization: Bearer $TOKEN" \\
     "https://secretmanager.googleapis.com/v1/projects/$PROJECT/secrets/$1/versions/latest:access" \\
-    | sed -n 's/.*"data":"\\([^"]*\\)".*/\\1/p' | base64 -d
+    | sed -n 's/.*"data": *"\\([^"]*\\)".*/\\1/p' | base64 -d
 }
 export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
 export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
 export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
+
+# Cloud SQL provisions only a default database, so create the agent's database
+# via the Admin API (idempotent - a 409 "already exists" is fine). The VM SA has
+# roles/editor. The agent retries connecting until this lands.
+# ponytail: belongs in a GCP::SQL::Database resource once the plugin has one.
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"name":"\(vars.dbName)"}' \\
+  "https://sqladmin.googleapis.com/v1/projects/$PROJECT/instances/\(dbInstanceName)/databases" >/dev/null 2>&1 || true
 
 # Retry transient ops: Cloud NAT egress may not be ready at first boot and
 # registry pulls (ghcr.io) can time out. 6 tries x 10s.
@@ -253,6 +263,9 @@ if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
 # COS has a read-only root (/mnt is not writable); /var is the stateful mount.
 mkdir -p /var/lib/tsnet
 mountpoint -q /var/lib/tsnet || mount "$TSDEV" /var/lib/tsnet
+# The agent container runs as non-root 'pel'; the freshly-formatted disk is
+# root-owned, so make the tsnet state dir writable or tsnet.Up cannot persist.
+chmod 0777 /var/lib/tsnet
 
 # Cloud SQL Auth Proxy: listens on 127.0.0.1:5432, authenticates via the VM SA.
 # --private-ip dials the instance's private IP over the VPC (no public IP exists).
@@ -266,7 +279,9 @@ docker run -d --restart always --name cloudsql-proxy --network host \\
 
 # Agent config, then the agent container (joins the tailnet, persists identity).
 mkdir -p /var/formae
-cat > /var/formae/formae.conf.pkl << 'PKLEOF'
+# Unquoted heredoc: the shell expands $FORMAE_DB_PASSWORD / $FORMAE_API_PASSWORD_HASH /
+# $TAILSCALE_AUTHKEY into the file (formae does not expand env vars in config).
+cat > /var/formae/formae.conf.pkl << PKLEOF
 \(agentConfig)
 PKLEOF
 
@@ -278,7 +293,7 @@ docker run -d --restart always --name formae-agent --network host \\
   -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
   -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH -e TAILSCALE_AUTHKEY \\
   "$FORMAE_IMAGE" \\
-  formae agent start
+  formae agent start --config /home/pel/.config/formae/formae.conf.pkl
 """
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
