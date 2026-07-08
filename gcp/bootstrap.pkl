@@ -240,18 +240,28 @@ export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
 export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
 export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
 
+# Retry transient ops: Cloud NAT egress may not be ready at first boot and
+# registry pulls (ghcr.io) can time out. 6 tries x 10s.
+retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 6 ] && return 1; echo "retry $n: $*"; sleep 10; done; }
+
 # Persistent tsnet identity disk (deviceName=tsnet). Wait for the by-id symlink
-# to appear (udev races the startup script), then format on first use.
+# (udev races the startup script), format on first use, mount idempotently
+# (this script re-runs on every boot).
 TSDEV=/dev/disk/by-id/google-tsnet
 for i in $(seq 1 30); do [ -b "$TSDEV" ] && break; sleep 2; done
 if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
 # COS has a read-only root (/mnt is not writable); /var is the stateful mount.
-mkdir -p /var/lib/tsnet && mount "$TSDEV" /var/lib/tsnet
+mkdir -p /var/lib/tsnet
+mountpoint -q /var/lib/tsnet || mount "$TSDEV" /var/lib/tsnet
 
 # Cloud SQL Auth Proxy: listens on 127.0.0.1:5432, authenticates via the VM SA.
 # --private-ip dials the instance's private IP over the VPC (no public IP exists).
+# rm -f first so a reboot re-creates the container instead of hitting a name clash.
+CSQL_IMAGE="gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest"
+retry docker pull "$CSQL_IMAGE"
+docker rm -f cloudsql-proxy >/dev/null 2>&1 || true
 docker run -d --restart always --name cloudsql-proxy --network host \\
-  gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest \\
+  "$CSQL_IMAGE" \\
   --address 0.0.0.0 --port 5432 --private-ip "\(dbConnName)"
 
 # Agent config, then the agent container (joins the tailnet, persists identity).
@@ -260,11 +270,14 @@ cat > /var/formae/formae.conf.pkl << 'PKLEOF'
 \(agentConfig)
 PKLEOF
 
+FORMAE_IMAGE="\(properties.formaeImage.value)"
+retry docker pull "$FORMAE_IMAGE"
+docker rm -f formae-agent >/dev/null 2>&1 || true
 docker run -d --restart always --name formae-agent --network host \\
   -v /var/lib/tsnet:/home/pel/.config/tsnet-formae \\
   -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
   -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH -e TAILSCALE_AUTHKEY \\
-  "\(properties.formaeImage.value)" \\
+  "$FORMAE_IMAGE" \\
   formae agent start
 """
 
