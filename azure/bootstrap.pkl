@@ -1,0 +1,613 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+amends "@formae/forma.pkl"
+import "@formae/formae.pkl"
+import "@azure/azure.pkl"
+
+import "@azure/resources/resourcegroup.pkl"
+import "@azure/resources/virtualnetwork.pkl"
+import "@azure/resources/subnet.pkl"
+import "@azure/network/networksecuritygroup.pkl"
+import "@azure/network/publicipaddress.pkl"
+import "@azure/network/networkinterface.pkl"
+import "@azure/network/privatednszone.pkl"
+import "@azure/network/privatednsvnetlink.pkl"
+import "@azure/network/privateendpoint.pkl"
+import "@azure/network/privatednszonegroup.pkl"
+import "@azure/dbforpostgresql/flexibleserver.pkl"
+import "@azure/dbforpostgresql/database.pkl"
+import "@azure/compute/virtualmachine.pkl"
+import "@azure/compute/virtualmachineextension.pkl"
+
+import "./vars.pkl"
+import "./sizing.pkl"
+
+description {
+    text = """
+    Formae agent on Azure - the "install formae into a production environment"
+    example. A long-running VM (the analog of the AWS ECS Fargate task and the
+    GCP GCE VM) runs the agent container, in one of two access modes:
+
+    - `public`: the agent terminates HTTPS itself with a self-signed certificate
+      generated on the VM at first boot (server.tlsCert/tlsKey), reachable at a
+      stable <name>.<location>.cloudapp.azure.com FQDN. Basic auth on top;
+      inbound restricted to --allowed-cidr. Connecting requires the CLI's
+      cli.api.insecureSkipVerify knob (formae PR #540).
+    - `tailnet`: private, reached only over your Tailscale tailnet (no public
+      inbound), serving a trusted *.ts.net certificate, with basic auth on top.
+      Mirrors the AWS/GCP `tailnet` mode.
+
+    Azure Database for PostgreSQL Flexible Server (public access disabled) backs
+    the agent, reached through a Private Endpoint + privatelink DNS zone inside
+    the VNet - no subnet delegation needed, TLS enforced (sslmode=require).
+
+    The agent's operating identity is a service principal you create up front
+    (az ad sp create-for-rbac); its credentials reach the agent as environment
+    variables via the CustomScript extension's protectedSettings (write-only,
+    encrypted by Azure, never readable back through the API). The azure plugin
+    has no VM managed-identity property yet - when it lands, the SP can be
+    replaced by a system-assigned identity and secrets can move to Key Vault
+    fetched at boot.
+
+    The VM keeps a public IP in BOTH modes: Azure retired default outbound
+    access for new VMs and the plugin has no NAT Gateway resource yet, so the
+    public IP provides egress (image pulls, tailnet). In tailnet mode no NSG
+    inbound rule exists, so nothing can reach it from the internet.
+    """
+    confirm = true
+}
+
+properties {
+    name = new formae.Prop {
+        flag = "name"
+        default = vars.projectName
+    }
+    location = new formae.Prop {
+        flag = "location"
+        default = vars.location
+    }
+    // Azure subscription the agent's infrastructure lives in. Required.
+    subscriptionId = new formae.Prop {
+        flag = "subscription-id"
+        default = vars.subscriptionId
+    }
+    // Entra tenant of the subscription. Required (service-principal login).
+    tenantId = new formae.Prop {
+        flag = "tenant-id"
+        default = ""
+    }
+    // Service principal the agent operates Azure with (az ad sp create-for-rbac
+    // --role Contributor --scopes /subscriptions/<sub>). Required.
+    clientId = new formae.Prop {
+        flag = "client-id"
+        default = ""
+    }
+    clientSecret = new formae.Prop {
+        flag = "client-secret"
+        default = ""
+    }
+    // VM t-shirt size; maps to an Azure VM size (see sizing.pkl).
+    size = new formae.Prop {
+        flag = "size"
+        default = "small"
+    }
+    // `public` (self-signed HTTPS endpoint) or `tailnet` (private, Tailscale).
+    access = new formae.Prop {
+        flag = "access"
+        default = "public"
+    }
+    // Full agent image reference. Upgrade the agent by re-applying with a newer tag.
+    formaeImage = new formae.Prop {
+        flag = "formae-image"
+        default = vars.formaeImage
+    }
+    // Basic-auth username for the agent API.
+    apiUser = new formae.Prop {
+        flag = "api-user"
+        default = "formae"
+    }
+    // Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
+    // azure/scripts/gen-api-credential.sh.
+    apiPasswordHash = new formae.Prop {
+        flag = "api-password-hash"
+        default = ""
+    }
+    // Postgres admin password. Supplied (not generated in-forma) so the value is
+    // stable across applies; gen-api-credential.sh prints one.
+    dbPassword = new formae.Prop {
+        flag = "db-password"
+        default = ""
+    }
+    // SSH public key for the VM admin user (Azure requires one even if you never
+    // log in). ssh-keygen -t ed25519 works.
+    sshPublicKey = new formae.Prop {
+        flag = "ssh-public-key"
+        default = ""
+    }
+    // public mode only: CIDR allowed to reach the agent API. Default: everywhere
+    // (basic auth + TLS still apply). Tighten for production.
+    allowedCidr = new formae.Prop {
+        flag = "allowed-cidr"
+        default = "*"
+    }
+    // tailnet mode only: a reusable Tailscale auth key (tagged tag:formae).
+    tsAuthkey = new formae.Prop {
+        flag = "ts-authkey"
+        default = ""
+    }
+    // tailnet mode only: the tailnet (MagicDNS) hostname. Defaults to --name.
+    tsHostname = new formae.Prop {
+        flag = "ts-hostname"
+        default = ""
+    }
+    vnetCidr = new formae.Prop {
+        flag = "vnet-cidr"
+        default = vars.vnetCidr
+    }
+    subnetCidr = new formae.Prop {
+        flag = "subnet-cidr"
+        default = vars.subnetCidr
+    }
+}
+
+// ── Required inputs ───────────────────────────────────────────────────────────
+local access =
+    let (a = properties.access.value)
+    if (a != "public" && a != "tailnet")
+        throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
+    else a
+local isPublic = access == "public"
+local isTailnet = access == "tailnet"
+
+local subscriptionIdVal =
+    if (properties.subscriptionId.value == "") throw("--subscription-id is required (the Azure subscription ID)")
+    else properties.subscriptionId.value
+local tenantIdVal =
+    if (properties.tenantId.value == "") throw("--tenant-id is required (the Entra tenant ID)")
+    else properties.tenantId.value
+local clientIdVal =
+    if (properties.clientId.value == "") throw("--client-id is required (service principal appId; az ad sp create-for-rbac)")
+    else properties.clientId.value
+local clientSecretVal =
+    if (properties.clientSecret.value == "") throw("--client-secret is required (service principal password)")
+    else properties.clientSecret.value
+local apiPasswordHashVal =
+    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required. Generate it with azure/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash.value
+local dbPasswordVal =
+    if (properties.dbPassword.value == "") throw("--db-password is required (a stable Postgres admin password; gen-api-credential.sh prints one)")
+    else properties.dbPassword.value
+local sshPublicKeyVal =
+    if (properties.sshPublicKey.value == "") throw("--ssh-public-key is required (contents of e.g. ~/.ssh/id_ed25519.pub)")
+    else properties.sshPublicKey.value
+local tsAuthkeyVal =
+    if (isTailnet && properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
+    else properties.tsAuthkey.value
+
+local n = properties.name.value
+local loc = properties.location.value
+local vmSizeVal = sizing.forSize(properties.size.value)
+local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+local dbServerName = "\(n)-db"
+// Flexible Server FQDNs are deterministic; inside the VNet the privatelink DNS
+// zone resolves this to the private endpoint's IP.
+local dbFqdn = "\(dbServerName).postgres.database.azure.com"
+// public mode: the stable DNS name the self-signed certificate is issued for.
+local agentFqdn = "\(n).\(loc).cloudapp.azure.com"
+
+// Every bootstrap-tier resource carries the app=formae-agent tag so the agent's
+// own discovery filter (emitted into the config below) can suppress this stack's
+// substrate rather than surfacing it as unmanaged drift.
+local commonTags: Listing<azure.Tag> = new {
+    new azure.Tag { key = "app"; value = "formae-agent" }
+}
+
+// ── Agent config file (written on the VM by the bootstrap script) ─────────────
+// auth-basic + server (TLS in public mode) + postgres datastore (private
+// endpoint FQDN, TLS enforced) + background work + (tailnet mode) a top-level
+// tailscale network block. Values are Pkl-interpolated at apply time; the whole
+// script travels in the CustomScript extension's protectedSettings (write-only,
+// encrypted by Azure).
+local serverTlsLines =
+    if (isPublic) "\n    tlsCert = \"/home/pel/.config/formae/tls.crt\"\n    tlsKey = \"/home/pel/.config/formae/tls.key\""
+    else ""
+
+local networkBlock =
+    if (isTailnet) """
+
+network = new NetworkConfig {
+  type = "tailscale"
+  tailscale = new TailscaleConfig {
+    tls = true
+    authKey = "\(tsAuthkeyVal)"
+    hostname = "\(tsHostnameVal)"
+    advertiseTags { "tag:formae" }
+  }
+}
+"""
+    else ""
+
+local agentConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Azure.pkl" as Azure
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+  auth = new AuthBasic.AgentConfig {
+    authorizedUsers {
+      new AuthBasic.AuthorizedUser {
+        username = "\(properties.apiUser.value)"
+        password = "\(apiPasswordHashVal)"
+      }
+    }
+  }
+  server {
+    port = \(vars.formaePort)\(serverTlsLines)
+  }
+  datastore {
+    datastoreType = "postgres"
+    postgres {
+      host = "\(dbFqdn)"
+      port = 5432
+      user = "\(vars.dbUser)"
+      password = "\(dbPasswordVal)"
+      database = "\(vars.dbName)"
+      connectionParams = "sslmode=require"
+    }
+  }
+  synchronization {
+    enabled = true
+    interval = 300.s
+  }
+  discovery {
+    enabled = true
+    interval = 600.s
+  }
+  resourcePlugins {
+    new Azure.PluginConfig {
+      // Suppress this agent's own substrate (everything tagged app=formae-agent)
+      // from discovery so it is not surfaced as unmanaged drift. NOTE: the exact
+      // Azure tag filter path is provider-specific and must be validated against
+      // a live discovery run; adjust the propertyPath if the substrate still leaks.
+      discoveryFilters = new Listing {
+        new MatchFilter {
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.tags.app"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+      }
+    }
+  }
+}\(networkBlock)
+"""
+
+// ── VM bootstrap script (Ubuntu 22.04, via CustomScript extension) ────────────
+// Installs docker, prepares mode-specific state (self-signed TLS cert / tsnet
+// identity dir), writes the agent config, and starts the agent container. The
+// script re-runs only when the extension resource is replaced, not on reboot;
+// --restart always keeps the containers up across reboots.
+//
+// NOTE: this runtime path is best-effort and must be validated with a real
+// `formae apply` (the GCP build needed six startup fixes found only live).
+local tlsSetup =
+    if (isPublic) """
+    # Self-signed certificate for the agent's public FQDN. Regenerated only when
+    # the VM is replaced. Readable by the container's non-root 'pel' user.
+    # ponytail: world-readable key on a single-purpose VM; swap for a Key Vault
+    # certificate + managed identity once the plugin can attach one.
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \\
+      -keyout /var/formae/tls.key -out /var/formae/tls.crt \\
+      -subj "/CN=\(agentFqdn)" -addext "subjectAltName=DNS:\(agentFqdn)"
+    chmod 0644 /var/formae/tls.crt /var/formae/tls.key
+    """
+    else """
+    # Persistent tsnet identity dir. Lives on the OS disk: the azure plugin has
+    # no VM data-disk attachment yet, so the tailnet machine identity survives
+    # reboots but NOT VM replacement (the node re-registers via the auth key;
+    # delete the stale node in the Tailscale admin console after a replace).
+    mkdir -p /var/lib/tsnet
+    # The agent container runs as non-root 'pel'; make the state dir writable.
+    chmod 0777 /var/lib/tsnet
+    """
+
+local dockerMounts =
+    if (isPublic) "-v /var/formae/tls.crt:/home/pel/.config/formae/tls.crt -v /var/formae/tls.key:/home/pel/.config/formae/tls.key"
+    else "-v /var/lib/tsnet:/home/pel/.config/tsnet-formae"
+
+local bootstrapScript = """
+#!/bin/bash
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+# Retry transient ops: apt mirrors and registry pulls (ghcr.io) can time out
+# right after boot. 6 tries x 10s.
+retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 6 ] && return 1; echo "retry $n: $*"; sleep 10; done; }
+
+retry apt-get update -y
+retry apt-get install -y docker.io
+systemctl enable --now docker
+
+mkdir -p /var/formae
+\(tlsSetup)
+# Quoted heredoc: everything (including the bcrypt hash's $2y$... prefix) is
+# already final text - nothing must be shell-expanded.
+cat > /var/formae/formae.conf.pkl << 'PKLEOF'
+\(agentConfig)
+PKLEOF
+
+FORMAE_IMAGE="\(properties.formaeImage.value)"
+retry docker pull "$FORMAE_IMAGE"
+docker rm -f formae-agent >/dev/null 2>&1 || true
+docker run -d --restart always --name formae-agent --network host \\
+  \(dockerMounts) \\
+  -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
+  -e AZURE_TENANT_ID='\(tenantIdVal)' \\
+  -e AZURE_CLIENT_ID='\(clientIdVal)' \\
+  -e AZURE_CLIENT_SECRET='\(clientSecretVal)' \\
+  "$FORMAE_IMAGE" \\
+  formae agent start --config /home/pel/.config/formae/formae.conf.pkl
+"""
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
+forma {
+    vars.stack
+    new formae.Target {
+        label = "bootstrap-target"
+        config = new azure.Config {
+            subscriptionId = subscriptionIdVal
+        }
+    }
+
+    // resource group + networking
+    rg
+    vnet
+    snet
+    nsg
+    pip
+    nic
+
+    // database (private endpoint + privatelink DNS)
+    db
+    dbDatabase
+    dnsZone
+    dnsLink
+    pe
+    peDns
+
+    // compute
+    vm
+    ext
+}
+
+// ── Resource group + networking ───────────────────────────────────────────────
+local rg = new resourcegroup.ResourceGroup {
+    label = "\(n)-rg"
+    name = "\(n)-rg"
+    location = loc
+    tags = commonTags
+}
+
+local vnet = new virtualnetwork.VirtualNetwork {
+    label = "\(n)-vnet"
+    name = "\(n)-vnet"
+    location = loc
+    resourceGroupName = rg.res.name
+    addressSpace = new virtualnetwork.AddressSpace {
+        addressPrefixes { properties.vnetCidr.value }
+    }
+    tags = commonTags
+}
+
+local snet = new subnet.Subnet {
+    label = "\(n)-subnet"
+    name = "\(n)-subnet"
+    resourceGroupName = rg.res.name
+    virtualNetworkName = vnet.res.name
+    addressPrefix = properties.subnetCidr.value
+}
+
+local nsg = new networksecuritygroup.NetworkSecurityGroup {
+    label = "\(n)-nsg"
+    name = "\(n)-nsg"
+    location = loc
+    resourceGroupName = rg.res.name
+    // public: the agent API port from --allowed-cidr. tailnet: no inbound rules
+    // at all - Azure's default rules deny internet inbound; tailscale needs
+    // outbound only.
+    securityRules = new Listing {
+        when (isPublic) {
+            new networksecuritygroup.SecurityRule {
+                name = "allow-agent-api"
+                priority = 100
+                direction = "Inbound"
+                access = "Allow"
+                protocol = "Tcp"
+                sourceAddressPrefix = properties.allowedCidr.value
+                sourcePortRange = "*"
+                destinationAddressPrefix = "*"
+                destinationPortRange = "\(vars.formaePort)"
+            }
+        }
+    }
+    tags = commonTags
+}
+
+// Public IP in BOTH modes: egress (Azure retired default outbound access; the
+// plugin has no NAT Gateway resource yet). Inbound is governed by the NSG.
+// The DNS label gives the stable FQDN the public-mode certificate is issued for.
+local pip = new publicipaddress.PublicIPAddress {
+    label = "\(n)-pip"
+    name = "\(n)-pip"
+    location = loc
+    resourceGroupName = rg.res.name
+    sku = new publicipaddress.PublicIPAddressSKU { name = "Standard" }
+    publicIPAllocationMethod = "Static"
+    dnsSettings = new publicipaddress.DnsSettings { domainNameLabel = n }
+    tags = commonTags
+}
+
+local nic = new networkinterface.NetworkInterface {
+    label = "\(n)-nic"
+    name = "\(n)-nic"
+    location = loc
+    resourceGroupName = rg.res.name
+    ipConfigurations {
+        new networkinterface.IPConfiguration {
+            name = "primary"
+            subnet = snet.res.id
+            publicIPAddress = pip.res.id
+            privateIPAllocationMethod = "Dynamic"
+            primary = true
+        }
+    }
+    networkSecurityGroup = nsg.res.id
+    tags = commonTags
+}
+
+// ── Database ──────────────────────────────────────────────────────────────────
+local db = new flexibleserver.FlexibleServer {
+    label = "\(n)-db"
+    name = dbServerName
+    location = loc
+    resourceGroupName = rg.res.name
+    sku = new flexibleserver.SKU {
+        name = vars.dbSkuName
+        tier = vars.dbSkuTier
+    }
+    version = vars.dbVersion
+    administratorLogin = vars.dbUser
+    // Set once at creation; the agent config carries the same value.
+    administratorLoginPassword = dbPasswordVal
+    storage = new flexibleserver.Storage {
+        storageSizeGB = vars.dbStorageGb
+        autoGrow = "Enabled"
+    }
+    // Reached exclusively through the private endpoint below.
+    network = new flexibleserver.Network {
+        publicNetworkAccess = "Disabled"
+    }
+    tags = commonTags
+}
+
+local dbDatabase = new database.Database {
+    label = "\(n)-db-database"
+    name = vars.dbName
+    resourceGroupName = rg.res.name
+    serverName = db.res.name
+}
+
+local dnsZone = new privatednszone.PrivateDnsZone {
+    label = "\(n)-pdns"
+    name = "privatelink.postgres.database.azure.com"
+    location = "global"
+    resourceGroupName = rg.res.name
+    tags = commonTags
+}
+
+local dnsLink = new privatednsvnetlink.PrivateDnsZoneVirtualNetworkLink {
+    label = "\(n)-pdns-link"
+    name = "\(n)-pdns-link"
+    location = "global"
+    resourceGroupName = rg.res.name
+    privateZoneName = dnsZone.res.name
+    virtualNetworkId = vnet.res.id
+    registrationEnabled = false
+    tags = commonTags
+}
+
+local pe = new privateendpoint.PrivateEndpoint {
+    label = "\(n)-db-pe"
+    name = "\(n)-db-pe"
+    location = loc
+    resourceGroupName = rg.res.name
+    subnetId = snet.res.id
+    privateLinkServiceConnections {
+        new privateendpoint.PrivateLinkServiceConnection {
+            name = "\(n)-db-plsc"
+            privateLinkServiceId = db.res.id
+            groupIds { "postgresqlServer" }
+        }
+    }
+    tags = commonTags
+}
+
+local peDns = new privatednszonegroup.PrivateDnsZoneGroup {
+    label = "\(n)-db-pe-dns"
+    name = "default"
+    resourceGroupName = rg.res.name
+    privateEndpointName = pe.res.name
+    privateDnsZoneConfigs {
+        new privatednszonegroup.PrivateDnsZoneConfig {
+            name = "postgres"
+            privateDnsZoneId = dnsZone.res.id
+        }
+    }
+}
+
+// ── Compute ───────────────────────────────────────────────────────────────────
+local vm = new virtualmachine.VirtualMachine {
+    label = "\(n)-vm"
+    name = "\(n)-agent"
+    location = loc
+    resourceGroupName = rg.res.name
+    vmSize = vmSizeVal
+    networkInterfaces {
+        new virtualmachine.NetworkInterfaceReference {
+            id = nic.res.id
+            primary = true
+        }
+    }
+    imageReference = new virtualmachine.ImageReference {
+        publisher = vars.vmImagePublisher
+        offer = vars.vmImageOffer
+        sku = vars.vmImageSku
+        version = vars.vmImageVersion
+    }
+    osDisk = new virtualmachine.OSDisk {
+        createOption = "FromImage"
+        managedDisk = new virtualmachine.ManagedDiskParameters {
+            storageAccountType = "StandardSSD_LRS"
+        }
+        diskSizeGB = vars.osDiskSizeGb
+        deleteOption = "Delete"
+    }
+    adminUsername = vars.vmAdminUser
+    linuxConfiguration = new virtualmachine.LinuxConfiguration {
+        disablePasswordAuthentication = true
+        ssh = new virtualmachine.SSHConfiguration {
+            publicKeys {
+                new virtualmachine.SSHPublicKey {
+                    path = "/home/\(vars.vmAdminUser)/.ssh/authorized_keys"
+                    keyData = sshPublicKeyVal
+                }
+            }
+        }
+    }
+    tags = commonTags
+}
+
+// CustomScript extension carries the whole bootstrap script (secrets included)
+// in protectedSettings: write-only, encrypted by Azure, never returned by the
+// API - the Azure stand-in for "fetch from a vault at boot" until the plugin
+// can attach a managed identity to the VM.
+local ext = new virtualmachineextension.VirtualMachineExtension {
+    label = "\(n)-vm-bootstrap"
+    name = "bootstrap"
+    location = loc
+    resourceGroupName = rg.res.name
+    virtualMachineName = vm.res.name
+    publisher = "Microsoft.Azure.Extensions"
+    type = "CustomScript"
+    typeHandlerVersion = "2.1"
+    autoUpgradeMinorVersion = true
+    protectedSettings = new Mapping {
+        ["script"] = bootstrapScript.base64
+    }
+    tags = commonTags
+}

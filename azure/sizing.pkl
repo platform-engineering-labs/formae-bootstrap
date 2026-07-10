@@ -1,0 +1,31 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+/// Agent sizing. Maps a t-shirt `size` to an Azure VM size.
+///
+/// Capacity guidance mirrors the agent-sizing table at
+/// https://docs.formae.io/en/latest/operations/installation/#agent-sizing
+///
+/// Memory has a FLOOR (~2 GB): the agent image loads all bundled resource
+/// plugins at once (aws + azure + gcp + k8s), a large constant footprint, so
+/// every tier is >= 2 GB. Standard_B1s (1 GB) OOMs the agent on startup.
+///
+/// small  ~ up to 1,000 resources   (Standard_B1ms,   1 vCPU / 2 GB)
+/// medium ~ 1,000-5,000 resources   (Standard_B2s,    2 vCPU / 4 GB)
+/// large  ~ 5,000-10,000 resources  (Standard_D2s_v5, 2 vCPU / 8 GB)
+/// xlarge ~ 10,000-20,000 resources (Standard_D4s_v5, 4 vCPU / 16 GB)
+module bootstrap.azure.sizing
+
+typealias Size = "small" | "medium" | "large" | "xlarge"
+
+hidden table: Mapping<Size, String> = new {
+    ["small"]  = "Standard_B1ms"
+    ["medium"] = "Standard_B2s"
+    ["large"]  = "Standard_D2s_v5"
+    ["xlarge"] = "Standard_D4s_v5"
+}
+
+function forSize(s: Size): String = table[s]

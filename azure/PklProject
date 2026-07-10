@@ -1,0 +1,12 @@
+amends "pkl:Project"
+
+dependencies {
+  ["formae"] {
+    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.87.0"
+  }
+
+  // Local dep: AZURE::Compute::VirtualMachineExtension is not in the published
+  // azure@0.1.6 package yet. Swap to the published package on the next azure
+  // plugin release.
+  ["azure"] = import("/Users/stheno/git/pel/plugins/formae-plugin-azure/schema/pkl/PklProject")
+}
