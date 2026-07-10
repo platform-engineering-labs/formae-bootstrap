@@ -513,7 +513,11 @@ local bootDisk = new disk.Disk {
     name = "\(n)-boot"
     sizeGb = vars.bootDiskSizeGb
     type = "pd-balanced"
-    sourceImage = vars.bootImage
+    // SetOnce: GCP resolves an image family to a concrete image on read, so a
+    // plain string would drift (family vs resolved) and, being createOnly, force
+    // a replace. formae.value(...).setOnce fixes it at create and excludes it
+    // from drift.
+    sourceImage = formae.value(vars.bootImage).setOnce
     labels = commonLabels
 }
 
