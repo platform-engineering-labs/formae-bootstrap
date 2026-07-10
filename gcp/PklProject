@@ -5,8 +5,7 @@ dependencies {
     uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.86.0"
   }
 
-  // Local path dependency on the GCP plugin schema until a gcp package is
-  // published. Point at the plugin's schema PklProject on disk. Swap for a
-  // published `package://…/gcp@X.Y.Z` uri once the plugin is released.
-  ["gcp"] = import("/Users/stheno/git/pel/plugins/formae-plugin-gcp/schema/pkl/PklProject")
+  ["gcp"] {
+    uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.8"
+  }
 }
