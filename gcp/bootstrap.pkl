@@ -18,6 +18,7 @@ import "@gcp/compute/globalAddress.pkl"
 import "@gcp/servicenetworking/connection.pkl"
 
 import "@gcp/sql/database.pkl"
+import "@gcp/sql/sqlDatabase.pkl"
 import "@gcp/secretmanager/secret.pkl"
 import "@gcp/secretmanager/secretVersion.pkl"
 import "@gcp/iam/serviceAccount.pkl"
@@ -242,13 +243,8 @@ export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
 export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
 export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
 
-# Cloud SQL provisions only a default database, so create the agent's database
-# via the Admin API (idempotent - a 409 "already exists" is fine). The VM SA has
-# roles/editor. The agent retries connecting until this lands.
-# ponytail: belongs in a GCP::SQL::Database resource once the plugin has one.
-curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"name":"\(vars.dbName)"}' \\
-  "https://sqladmin.googleapis.com/v1/projects/$PROJECT/instances/\(dbInstanceName)/databases" >/dev/null 2>&1 || true
+# The agent's "formae" database is created by the GCP::SQL::Database resource
+# (formaeDb), not here. The agent retries connecting until the instance is ready.
 
 # Retry transient ops: Cloud NAT egress may not be ready at first boot and
 # registry pulls (ghcr.io) can time out. 6 tries x 10s.
@@ -325,6 +321,7 @@ forma {
 
     // database + secrets
     db
+    formaeDb
     dbSecret
     dbSecretVersion
     apiSecret
@@ -457,6 +454,16 @@ local db = new database.DatabaseInstance {
             privateNetwork = psaConn.res.network
         }
     }
+}
+
+// The agent's application database. A fresh Cloud SQL instance ships only the
+// engine's default database; this creates the "formae" database the agent
+// connects to (replaces the old startup-script Admin API curl).
+local formaeDb = new sqlDatabase.Database {
+    label = "\(n)-database"
+    project = projectVal
+    instance = db.res.name
+    name = vars.dbName
 }
 
 // ── Secrets ─────────────────────────────────────────────────────────────────
