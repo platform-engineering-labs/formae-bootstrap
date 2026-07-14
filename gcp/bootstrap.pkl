@@ -565,7 +565,10 @@ local agentVm = new instance.Instance {
     }
     metadata = new instance.Metadata {
         items {
-            ["startup-script"] = startupScript
+            new instance.MetadataItem {
+                key = "startup-script"
+                value = startupScript
+            }
         }
     }
 }
