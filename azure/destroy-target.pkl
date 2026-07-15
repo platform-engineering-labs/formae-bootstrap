@@ -14,7 +14,7 @@ import "./vars.pkl"
 
 forma {
     new formae.Target {
-        label = "bootstrap-target"
+        label = "azure-bootstrap-target"
         config = new azure.Config {
             subscriptionId = vars.subscriptionId
         }

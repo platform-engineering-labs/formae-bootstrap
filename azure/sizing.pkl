@@ -11,21 +11,30 @@
 ///
 /// Memory has a FLOOR (~2 GB): the agent image loads all bundled resource
 /// plugins at once (aws + azure + gcp + k8s), a large constant footprint, so
-/// every tier is >= 2 GB. Standard_B1s (1 GB) OOMs the agent on startup.
+/// every tier is >= 2 GB. 1 GB SKUs OOM the agent on startup.
 ///
-/// small  ~ up to 1,000 resources   (Standard_B1ms,   1 vCPU / 2 GB)
-/// medium ~ 1,000-5,000 resources   (Standard_B2s,    2 vCPU / 4 GB)
-/// large  ~ 5,000-10,000 resources  (Standard_D2s_v5, 2 vCPU / 8 GB)
-/// xlarge ~ 10,000-20,000 resources (Standard_D4s_v5, 4 vCPU / 16 GB)
+/// SKU choice is constrained by what a FRESH subscription can actually run:
+/// first-gen B-series (B1ms/B2s) is no longer offered to new subscriptions,
+/// and the v2 burstable + v5 D families ship with a default vCPU quota of 0
+/// (a quota-increase ticket away). The Dsv6 family has a default quota of 10
+/// vCPUs, so it works out of the box - hence the dedicated-core defaults.
+/// Swap in Standard_B2als_v2 (2 vCPU / 4 GB) or Standard_B2s_v2 (2 / 8) for
+/// roughly half the cost once your standardBasv2Family/standardBsv2Family
+/// quota is granted.
+///
+/// small  ~ up to 1,000 resources   (Standard_D2s_v6, 2 vCPU / 8 GB)
+/// medium ~ 1,000-5,000 resources   (Standard_D2s_v6, 2 vCPU / 8 GB)
+/// large  ~ 5,000-10,000 resources  (Standard_D4s_v6, 4 vCPU / 16 GB)
+/// xlarge ~ 10,000-20,000 resources (Standard_D8s_v6, 8 vCPU / 32 GB)
 module bootstrap.azure.sizing
 
 typealias Size = "small" | "medium" | "large" | "xlarge"
 
 hidden table: Mapping<Size, String> = new {
-    ["small"]  = "Standard_B1ms"
-    ["medium"] = "Standard_B2s"
-    ["large"]  = "Standard_D2s_v5"
-    ["xlarge"] = "Standard_D4s_v5"
+    ["small"]  = "Standard_D2s_v6"
+    ["medium"] = "Standard_D2s_v6"
+    ["large"]  = "Standard_D4s_v6"
+    ["xlarge"] = "Standard_D8s_v6"
 }
 
 function forSize(s: Size): String = table[s]

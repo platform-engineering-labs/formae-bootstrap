@@ -101,6 +101,6 @@ depends on it.
 ## Teardown
 
 ```bash
-formae destroy stack formae-bootstrap
+formae destroy stack formae-bootstrap-azure
 formae apply --mode reconcile azure/destroy-target.pkl   # deregister the target
 ```

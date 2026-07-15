@@ -325,12 +325,17 @@ local bootstrapScript = """
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
+# The CustomScript extension races cloud-init, which rewrites the apt sources
+# on first boot - apt sees half-configured lists and "cannot locate" packages
+# that are plainly in universe. Wait for cloud-init before touching apt.
+cloud-init status --wait >/dev/null 2>&1 || true
+
 # Retry transient ops: apt mirrors and registry pulls (ghcr.io) can time out
-# right after boot. 6 tries x 10s.
+# right after boot. 6 tries x 10s. update+install retried as ONE unit so a
+# torn package list is refreshed before the next install attempt.
 retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 6 ] && return 1; echo "retry $n: $*"; sleep 10; done; }
 
-retry apt-get update -y
-retry apt-get install -y docker.io
+retry bash -c 'apt-get update -y && apt-get install -y docker.io'
 systemctl enable --now docker
 
 mkdir -p /var/formae
@@ -358,7 +363,10 @@ docker run -d --restart always --name formae-agent --network host \\
 forma {
     vars.stack
     new formae.Target {
-        label = "bootstrap-target"
+        // Cloud-scoped label: the aws/ and gcp/ bootstraps register "bootstrap-target",
+        // and a target label is unique per agent across namespaces - reusing it here
+        // fails when the same local agent has bootstrapped another cloud before.
+        label = "azure-bootstrap-target"
         config = new azure.Config {
             subscriptionId = subscriptionIdVal
         }
