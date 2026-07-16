@@ -33,6 +33,6 @@ formaeImage = "ghcr.io/platform-engineering-labs/formae:0.87.0"
 formaePort = 49684
 
 stack: formae.Stack = new {
-    label = "formae-bootstrap"
+    label = "formae-gcp-bootstrap"
     description = "Formae production infrastructure on GCP"
 }
