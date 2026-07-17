@@ -1,0 +1,136 @@
+# Formae agent on GCP
+
+One command stands up a production **formae agent** on GCP — a VPC, a GCE VM running
+the agent container, and a Cloud SQL PostgreSQL database — secure by default, reached
+privately over your Tailscale tailnet.
+
+- **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
+  serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
+
+This mirrors the AWS `tailnet` mode. A **public HTTPS** mode (the AWS `alb` equivalent)
+is not offered yet — see [Not yet supported](#not-yet-supported).
+
+Formae runs as a client and an agent: you use your local install to provision the
+agent's permanent home in the cloud, then point your CLI at it with a profile and hand
+off.
+
+## How it works
+
+A long-running **GCE VM** (Container-Optimized OS) is the analog of the AWS ECS Fargate
+task. It runs two containers via a startup script:
+
+- the **formae agent**, which joins your tailnet (embedded tsnet), serves a trusted
+  `*.ts.net` cert + basic auth, and persists its tailnet machine identity to an attached
+  **persistent disk** (the GCP analog of the AWS tailnet EFS volume);
+- the **Cloud SQL Auth Proxy**, which the agent connects to on `127.0.0.1:5432`,
+  authenticating to Cloud SQL with the VM's service account (`roles/cloudsql.client`) —
+  no VPC private-service-access needed.
+
+The VM sits in a **private subnet** with **Cloud NAT** for egress (no external IP).
+Secrets — the DB password, the API basic-auth bcrypt hash, and the Tailscale auth key —
+live in **Secret Manager** and are fetched by the VM at boot via its metadata token;
+they are never placed in instance metadata.
+
+## Prerequisites
+
+- A GCP project, with these APIs enabled:
+  ```bash
+  gcloud services enable compute.googleapis.com sqladmin.googleapis.com \
+    secretmanager.googleapis.com --project <project>
+  ```
+- Local credentials for the formae agent's GCP plugin — either
+  `gcloud auth application-default login` (user ADC, simplest) or
+  `export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json`. **(Re)start the
+  agent after setting them** so the plugin picks them up; without credentials the
+  GCP plugin fails every call with `invalid_grant` / `invalid_rapt`.
+- A reusable **Tailscale auth key** tagged `tag:formae`, with HTTPS certificates enabled
+  on your tailnet.
+
+## Quickstart
+
+```bash
+git clone https://github.com/platform-engineering-labs/formae-bootstrap.git
+cd formae-bootstrap
+
+# Generate the basic-auth credential + a DB password. Keep the printed values.
+gcp/scripts/gen-api-credential.sh
+```
+
+```bash
+formae apply --mode reconcile gcp/bootstrap.pkl \
+  --project <project> \
+  --api-user formae --api-password-hash '<hash>' \
+  --db-password '<db-password>' \
+  --ts-authkey '<tskey>' --ts-hostname formae-bootstrap \
+  --watch
+
+# From a machine on the same tailnet:
+gcp/scripts/write-bootstrap-profile.sh --profile bootstrap \
+  --fqdn formae-bootstrap.<your-tailnet>.ts.net --user formae --password '<password>'
+formae status agent --profile bootstrap
+```
+
+## Flags
+
+| Flag | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `--project` | yes | — | GCP project ID |
+| `--api-password-hash` | yes | — | bcrypt hash from `gen-api-credential.sh` |
+| `--db-password` | yes | — | stable Cloud SQL postgres password |
+| `--ts-authkey` | yes | — | reusable Tailscale auth key (`tag:formae`) |
+| `--ts-hostname` | no | `--name` | tailnet MagicDNS hostname |
+| `--name` | no | `formae-bootstrap` | resource name prefix |
+| `--region` / `--zone` | no | `us-central1` / `us-central1-a` | location |
+| `--size` | no | `small` | agent VM size (small/medium/large/xlarge → GCE machine type) |
+| `--formae-image` | no | pinned | agent image (version knob) |
+| `--subnet-cidr` | no | `10.100.1.0/24` | private subnet range |
+
+## Upgrading
+
+Re-apply with a newer `--formae-image` (same flags). **Keep this local install and its
+datastore** — it holds the agent's own infrastructure in state, so upgrades depend on it.
+
+## Teardown
+
+Destroy the stack, then deregister the target:
+
+```bash
+formae destroy --query "stack:formae-gcp-bootstrap"
+formae apply --mode destroy gcp/destroy-target.pkl
+```
+
+> **Note:** you currently need to run the `destroy` **twice**. The first pass
+> deletes the agent VM but its Cloud SQL Auth Proxy connections take a moment to
+> drain; the `formae` database delete then fails with
+> `pq: database "formae" is being accessed by other users`. Re-running `destroy`
+> once the sessions have been reaped completes the teardown. Tracked in
+> [issue #4](https://github.com/platform-engineering-labs/formae-bootstrap/issues/4).
+
+## Not yet supported
+
+- **Public HTTPS mode** (AWS `alb` equivalent). A GCE-VM-backed external HTTPS load
+  balancer needs instance-group *membership* management (add the VM to an unmanaged
+  instance group), which the GCP plugin does not implement yet. The serverless NEG and
+  managed SSL certificate resources exist; only VM membership is missing.
+
+## Validation status
+
+`pkl eval` and `formae apply --simulate` are clean. A live apply created 15/19 resources
+including the running VM (network, NAT, disks, secrets, service account, IAM bindings all
+succeeded, in correct dependency order). Two blockers stop a full end-to-end run in the
+test environment; both are plugin/environment issues, not the forma:
+
+1. **Cloud SQL.** The test org enforces `constraints/sql.restrictPublicIp`, which rejects
+   the public-IP + Auth-Proxy approach. The private-IP alternative needs Private Service
+   Access (a `servicenetworking` VPC-peering connection), which the GCP plugin does not
+   implement yet. Until the plugin supports PSA (or the org allows public IP), point the
+   agent at an **existing** database instead.
+2. **Re-apply idempotency.** network/subnetwork/disk references don't round-trip on read
+   (`.res.selfLink` renders a full `https://…` URL but GCP stores the `projects/…` path;
+   a boot-disk `sourceImage` *family* resolves to a specific image), so reconcile computes
+   spurious **replaces** of the subnet + boot disk, which fail while the VM is using them.
+   A plugin read-normalization fix is needed for clean upgrades.
+
+The **VM runtime path** (COS startup script: secret fetch, tsnet disk mount, Cloud SQL
+proxy, agent container on the tailnet) was not reached end-to-end because the DB never
+came up; it still needs a first real run once the Cloud SQL blocker is resolved.

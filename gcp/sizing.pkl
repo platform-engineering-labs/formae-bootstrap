@@ -1,0 +1,32 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+/// Agent sizing. Maps a t-shirt `size` to a GCE machine type.
+///
+/// Capacity guidance mirrors the agent-sizing table at
+/// https://docs.formae.io/en/latest/operations/installation/#agent-sizing
+///
+/// Memory has a FLOOR (~2 GB): the agent image loads all bundled resource
+/// plugins at once (aws + azure + gcp + k8s), a large constant footprint, so
+/// every tier is >= 2 GB. e2-small is 2 GB; the smaller shared-core types
+/// (e2-micro 1 GB) OOM the agent on startup.
+///
+/// small  ~ up to 1,000 resources   (e2-small,      2 vCPU-burst / 2 GB)
+/// medium ~ 1,000-5,000 resources   (e2-medium,     2 vCPU-burst / 4 GB)
+/// large  ~ 5,000-10,000 resources  (e2-standard-2, 2 vCPU / 8 GB)
+/// xlarge ~ 10,000-20,000 resources (e2-standard-4, 4 vCPU / 16 GB)
+module bootstrap.gcp.sizing
+
+typealias Size = "small" | "medium" | "large" | "xlarge"
+
+hidden table: Mapping<Size, String> = new {
+    ["small"]  = "e2-small"
+    ["medium"] = "e2-medium"
+    ["large"]  = "e2-standard-2"
+    ["xlarge"] = "e2-standard-4"
+}
+
+function forSize(s: Size): String = table[s]
