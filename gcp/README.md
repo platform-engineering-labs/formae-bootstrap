@@ -1,14 +1,20 @@
 # Formae agent on GCP
 
 One command stands up a production **formae agent** on GCP — a VPC, a GCE VM running
-the agent container, and a Cloud SQL PostgreSQL database — secure by default, reached
-privately over your Tailscale tailnet.
+the agent container, and a Cloud SQL PostgreSQL database — secure by default. Two
+access modes via `--access` (there is no plaintext option):
 
-- **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
-  serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
+- **`public`** — a global external HTTPS load balancer terminating HTTPS with **your**
+  certificate (`--cert-file`/`--key-file`, or a pre-created `--cert-name`), with HTTP
+  basic auth on top. The agent VM never gets a public IP; the load balancer is the only
+  ingress. GCP's analog of the AWS `alb` mode.
+- **`tailnet`** (default) — private, reached only over your Tailscale tailnet (no public
+  ingress), serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
 
-This mirrors the AWS `tailnet` mode. A **public HTTPS** mode (the AWS `alb` equivalent)
-is not offered yet — see [Not yet supported](#not-yet-supported).
+> **Version dependency.** `--access public` requires a GCP plugin that implements
+> `GCP::Compute::InstanceGroup` VM membership (the `instances` field) and the widened
+> `SslCertificate.privateKey`. Until those land in a published release, `gcp/PklProject`
+> points at a **local** plugin checkout; see [Version dependency](#version-dependency).
 
 Formae runs as a client and an agent: you use your local install to provision the
 agent's permanent home in the cloud, then point your CLI at it with a profile and hand
@@ -56,6 +62,8 @@ cd formae-bootstrap
 gcp/scripts/gen-api-credential.sh
 ```
 
+**`tailnet`** (default — private, over your Tailscale tailnet):
+
 ```bash
 formae apply --mode reconcile gcp/bootstrap.pkl \
   --project <project> \
@@ -70,20 +78,63 @@ gcp/scripts/write-bootstrap-profile.sh --profile bootstrap \
 formae status agent --profile bootstrap
 ```
 
+**`public`** (public HTTPS load balancer with your certificate):
+
+```bash
+# Bring your own PEM cert + key (self-signed is fine for a smoke test):
+formae apply --mode reconcile gcp/bootstrap.pkl --access public \
+  --project <project> \
+  --cert-file ./fullchain.pem --key-file ./privkey.pem \
+  --domain formae.example.com \
+  --api-user formae --api-password-hash '<hash>' \
+  --db-password '<db-password>' \
+  --watch
+
+# ...or reference a certificate you pre-created in the project:
+#   --cert-name my-existing-cert   (instead of --cert-file/--key-file)
+
+# Point your DNS A record at the reserved global address the stack prints, then:
+curl -u formae:'<password>' https://formae.example.com/api/v1/agent
+# health check is basic-auth-exempt:
+curl https://formae.example.com/api/v1/health
+```
+
+Pass **either** `--cert-name <existing>` **or** both `--cert-file` and `--key-file`
+(paths are read at apply time; give absolute paths or paths relative to `gcp/`). The
+private key is stored **opaque** — it never lands readably in plans or state.
+
 ## Flags
 
 | Flag | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `--project` | yes | — | GCP project ID |
-| `--api-password-hash` | yes | — | bcrypt hash from `gen-api-credential.sh` |
-| `--db-password` | yes | — | stable Cloud SQL postgres password |
-| `--ts-authkey` | yes | — | reusable Tailscale auth key (`tag:formae`) |
-| `--ts-hostname` | no | `--name` | tailnet MagicDNS hostname |
+| `--access` | no | `tailnet` | `public` (HTTPS LB) or `tailnet` (Tailscale) |
+| `--api-password-hash` | yes (both modes) | — | bcrypt hash from `gen-api-credential.sh` |
+| `--db-password` | yes (both modes) | — | stable Cloud SQL postgres password |
+| `--cert-name` | public: one of these two | — | name of a pre-created global `SslCertificate` |
+| `--cert-file` + `--key-file` | public: one of these two | — | PEM cert chain + key; creates a `SELF_MANAGED` cert in-stack (key stored opaque) |
+| `--domain` | no (public) | — | hostname clients connect to; point its DNS at the printed address |
+| `--ts-authkey` | yes (tailnet) | — | reusable Tailscale auth key (`tag:formae`) |
+| `--ts-hostname` | no (tailnet) | `--name` | tailnet MagicDNS hostname |
 | `--name` | no | `formae-bootstrap` | resource name prefix |
 | `--region` / `--zone` | no | `us-central1` / `us-central1-a` | location |
 | `--size` | no | `small` | agent VM size (small/medium/large/xlarge → GCE machine type) |
 | `--formae-image` | no | pinned | agent image (version knob) |
 | `--subnet-cidr` | no | `10.100.1.0/24` | private subnet range |
+
+Cross-mode flags are rejected fast: `--cert-*`/`--domain` throw under `tailnet`, and
+`--ts-authkey`/`--ts-hostname` throw under `public`, with a clear message.
+
+### Public mode notes
+
+- **DNS.** The stack reserves a global anycast address and prints it; point your domain's
+  `A` record at it. For a smoke test without DNS, use `curl --resolve <domain>:443:<ip>`.
+- **Firewall.** Google's health-check + front-end ranges `130.211.0.0/22` and
+  `35.191.0.0/16` are admitted to the formae port (`49684`), scoped to the agent VM's
+  service account — backends never report healthy without this rule.
+- **Certificate rotation.** GCP `SslCertificate` resources are **immutable** (all fields
+  create-only). To rotate, apply with a new `--cert-name` (or a changed cert file that
+  yields a new resource name) and re-apply; there is no in-place cert update.
 
 ## Upgrading
 
@@ -106,12 +157,24 @@ formae apply --mode destroy gcp/destroy-target.pkl
 > once the sessions have been reaped completes the teardown. Tracked in
 > [issue #4](https://github.com/platform-engineering-labs/formae-bootstrap/issues/4).
 
-## Not yet supported
+## Version dependency
 
-- **Public HTTPS mode** (AWS `alb` equivalent). A GCE-VM-backed external HTTPS load
-  balancer needs instance-group *membership* management (add the VM to an unmanaged
-  instance group), which the GCP plugin does not implement yet. The serverless NEG and
-  managed SSL certificate resources exist; only VM membership is missing.
+`--access public` depends on GCP plugin features added in the
+`feat/instance-group-membership` branch:
+
+- `GCP::Compute::InstanceGroup.instances` — VM membership reconcile (the backend group
+  must actually contain the agent VM);
+- `GCP::Compute::SslCertificate.privateKey` widened to accept an opaque-wrapped value.
+
+Until those ship in a published hub release, `gcp/PklProject` points `["gcp"]` at a
+**local checkout** of that plugin branch. Before merging a public-mode change, cut the
+plugin dev tag (`0.1.9-dev.0` or later) and switch the pin to:
+
+```pkl
+["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9-dev.0" }
+```
+
+The `tailnet` mode has no such dependency and works against the current published plugin.
 
 ## Validation status
 
