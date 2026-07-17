@@ -15,7 +15,12 @@ permanent home in the cloud, then point your CLI at it with a profile and hand o
 
 ## Prerequisites
 
-- A **service principal** the agent operates Azure with:
+- **Local Azure credentials** for the formae agent you run locally to perform the apply. The
+  agent's Azure plugin uses the `DefaultAzureCredential` chain, so `az login` on this machine is
+  enough (or set `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET`). Restart the local
+  agent after setting them. This is separate from the service principal below, which is the identity
+  the *remote* agent runs as.
+- A **service principal** the remote agent operates Azure with:
 
   ```bash
   az ad sp create-for-rbac --name formae-agent --role Contributor \
@@ -98,9 +103,43 @@ depends on it.
 - **Compute is a VM**, not ACI/Container Apps (not in plugin coverage yet) — same shape as the
   GCP bootstrap's GCE VM.
 
+## Flags
+
+| Flag | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `--access` | — | `public` | `public` (self-signed HTTPS) or `tailnet` |
+| `--location` | — | `eastus` | Azure region. Must accept new customers and offer PostgreSQL Flexible Server + the chosen VM size (see Troubleshooting) |
+| `--name` | — | `formae-bootstrap` | Prefix for every resource. **Must be globally unique** — it drives the PostgreSQL server FQDN (`<name>-db.postgres.database.azure.com`) and the public DNS label, both of which collide across subscriptions. Change it if the default is taken |
+| `--size` | — | `small` | `small`/`medium`/`large`/`xlarge` → Dsv6 VM sizes (see `sizing.pkl`; fresh subscriptions get 0 vCPU quota on B-series and v5 families, so Dsv6 is the default) |
+| `--subscription-id` | yes | — | Target subscription |
+| `--tenant-id` / `--client-id` / `--client-secret` | yes | — | Remote agent's service principal |
+| `--api-user` / `--api-password-hash` | yes | `formae` / — | Basic-auth credential (`gen-api-credential.sh` prints the hash) |
+| `--db-password` | yes | — | Stable Postgres admin password. Reuse the **same** value on every re-apply |
+| `--ssh-public-key` | yes | — | Admin key on the VM (no inbound SSH rule is opened; see Troubleshooting) |
+| `--allowed-cidr` | — | `*` | `public` mode only: source CIDR allowed to the agent API. Tighten for production |
+| `--ts-authkey` / `--ts-hostname` | tailnet | — | `tailnet` mode only: reusable auth key tagged `tag:formae`, and the tailnet hostname |
+| `--vnet-cidr` / `--subnet-cidr` | — | `10.100.0.0/16` / `10.100.1.0/24` | Address space |
+| `--formae-image` | — | pinned in `vars.pkl` | Agent image; bump to upgrade |
+
+## Troubleshooting
+
+- **No inbound SSH.** The NSG opens only the agent API port (`public` mode) or nothing
+  (`tailnet` mode); Azure's default rules deny all other inbound. The SSH key is required by Azure
+  but there is no public path to port 22. To debug a VM that won't boot the agent, use
+  `az serial-console connect -g <name>-rg -n <name>-agent` or the portal's Serial Console.
+- **`--name` already taken.** A failed create on `<name>-db` (PostgreSQL server name is globally
+  unique) or the public DNS label means the default `formae-bootstrap` is in use. Re-run with a
+  unique `--name`.
+- **Region rejects the deployment.** Fresh subscriptions are restricted in many regions. If apply
+  fails with `LocationIsOfferRestricted` (Postgres), `RequestDisallowedByAzure` (region closed to
+  new customers), or a `standard*Family` quota error (VM size), pick another region or request a
+  quota increase.
+
 ## Teardown
 
+Destroy the stack, then deregister the target:
+
 ```bash
-formae destroy stack formae-bootstrap-azure
-formae apply --mode reconcile azure/destroy-target.pkl   # deregister the target
+formae destroy --query "stack:formae-bootstrap-azure"
+formae apply --mode destroy azure/destroy-target.pkl
 ```

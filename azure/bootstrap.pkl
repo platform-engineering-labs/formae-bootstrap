@@ -291,10 +291,10 @@ agent {
 // Installs docker, prepares mode-specific state (self-signed TLS cert / tsnet
 // identity dir), writes the agent config, and starts the agent container. The
 // script re-runs only when the extension resource is replaced, not on reboot;
-// --restart always keeps the containers up across reboots.
-//
-// NOTE: this runtime path is best-effort and must be validated with a real
-// `formae apply` (the GCP build needed six startup fixes found only live).
+// --restart always keeps the containers up across reboots. Because the script
+// travels in protectedSettings, any change to it (e.g. a new --formae-image)
+// changes the extension's inputs and triggers a re-run — this is how upgrades
+// land. Validated live end-to-end in both access modes.
 local tlsSetup =
     if (isPublic) """
     # Self-signed certificate for the agent's public FQDN. Regenerated only when

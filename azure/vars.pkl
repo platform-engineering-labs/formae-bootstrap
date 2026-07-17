@@ -35,8 +35,9 @@ formaeImage = "ghcr.io/platform-engineering-labs/formae:0.87.0"
 formaePort = 49684
 
 stack: formae.Stack = new {
-    // Cloud-scoped label: aws/ and gcp/ use "formae-bootstrap"; stack labels are
-    // unique per agent, so reusing it would reconcile-away another cloud's records.
+    // Cloud-scoped label (aws/ uses "formae-bootstrap", gcp/ uses
+    // "formae-gcp-bootstrap"): stack labels are unique per agent, so a
+    // cloud-neutral label would reconcile-away another cloud's records.
     label = "formae-bootstrap-azure"
     description = "Formae production infrastructure on Azure"
 }
