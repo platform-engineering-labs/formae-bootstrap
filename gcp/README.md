@@ -99,9 +99,16 @@ datastore** — it holds the agent's own infrastructure in state, so upgrades de
 Destroy the stack, then deregister the target:
 
 ```bash
-formae destroy --stack formae-bootstrap
+formae destroy --query "stack:formae-gcp-bootstrap"
 formae apply --mode destroy gcp/destroy-target.pkl
 ```
+
+> **Note:** you currently need to run the `destroy` **twice**. The first pass
+> deletes the agent VM but its Cloud SQL Auth Proxy connections take a moment to
+> drain; the `formae` database delete then fails with
+> `pq: database "formae" is being accessed by other users`. Re-running `destroy`
+> once the sessions have been reaped completes the teardown. Tracked in
+> [issue #4](https://github.com/platform-engineering-labs/formae-bootstrap/issues/4).
 
 ## Not yet supported
 
