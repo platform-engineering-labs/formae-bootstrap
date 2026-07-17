@@ -38,17 +38,13 @@ they are never placed in instance metadata.
   gcloud services enable compute.googleapis.com sqladmin.googleapis.com \
     secretmanager.googleapis.com --project <project>
   ```
-- Local credentials that can create the above (a service-account key or
-  `gcloud auth application-default login`).
+- Local credentials for the formae agent's GCP plugin — either
+  `gcloud auth application-default login` (user ADC, simplest) or
+  `export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json`. **(Re)start the
+  agent after setting them** so the plugin picks them up; without credentials the
+  GCP plugin fails every call with `invalid_grant` / `invalid_rapt`.
 - A reusable **Tailscale auth key** tagged `tag:formae`, with HTTPS certificates enabled
   on your tailnet.
-
-> **Local plugin dependency (temporary).** Until the GCP plugin is published,
-> `gcp/PklProject` points `@gcp` at the plugin's schema on disk via a local path
-> dependency. Edit that path to your checkout of
-> `platform-engineering-labs/formae-plugin-gcp` (schema/pkl), then run
-> `pkl project resolve` in `gcp/`. Swap it for a `package://…/gcp@X.Y.Z` uri once the
-> plugin is released.
 
 ## Quickstart
 
