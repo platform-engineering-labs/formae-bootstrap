@@ -1,7 +1,7 @@
 # formae-bootstrap
 
 Stand up a self-hosted **formae agent** on a cloud provider. Each provider lives in its own
-directory; AWS is the first.
+directory.
 
 ## How it works
 
@@ -24,3 +24,16 @@ option:
   serving a trusted `*.ts.net` certificate, with basic auth on top.
 
 Full instructions in [`aws/README.md`](aws/README.md).
+
+## Azure
+
+[`azure/`](azure/) installs a production formae agent on a VM, backed by Azure Database for
+PostgreSQL Flexible Server reached through a private endpoint (no public database access).
+One command, two **secure** access modes — there is no plaintext option:
+
+- **`public`** — the agent terminates HTTPS itself with a self-signed certificate, served at
+  a stable `<name>.<location>.cloudapp.azure.com` FQDN, plus HTTP basic auth.
+- **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
+  serving a trusted `*.ts.net` certificate, with basic auth on top.
+
+Full instructions in [`azure/README.md`](azure/README.md).
