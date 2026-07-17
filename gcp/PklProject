@@ -5,7 +5,14 @@ dependencies {
     uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.86.0"
   }
 
-  ["gcp"] {
-    uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.8"
-  }
+  // DEV REFERENCE — points at a local checkout of the GCP plugin's
+  // feat/instance-group-membership branch, which adds
+  // GCP::Compute::InstanceGroup.instances (VM membership) and the widened
+  // SslCertificate.privateKey that --access public needs. These are not in a
+  // published hub release yet.
+  //
+  // Before this bootstrap PR merges, replace this with the published dev pin:
+  //   ["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9-dev.0" }
+  // (cut once the plugin PR lands — see the README "Version dependency" note).
+  ["gcp"] = import("/Users/stheno/git/pel/plugins/formae-plugin-gcp/.worktrees/instance-group-membership/schema/pkl/PklProject")
 }

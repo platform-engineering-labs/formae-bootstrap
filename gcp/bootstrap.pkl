@@ -15,6 +15,14 @@ import "@gcp/compute/routerNat.pkl"
 import "@gcp/compute/disk.pkl"
 import "@gcp/compute/instance.pkl"
 import "@gcp/compute/globalAddress.pkl"
+import "@gcp/compute/firewall.pkl"
+import "@gcp/compute/healthCheck.pkl"
+import "@gcp/compute/instanceGroup.pkl"
+import "@gcp/compute/backendService.pkl"
+import "@gcp/compute/urlMap.pkl"
+import "@gcp/compute/targetHttpsProxy.pkl"
+import "@gcp/compute/globalForwardingRule.pkl"
+import "@gcp/compute/sslCertificate.pkl"
 import "@gcp/servicenetworking/connection.pkl"
 
 import "@gcp/sql/database.pkl"
@@ -30,25 +38,30 @@ import "./sizing.pkl"
 description {
     text = """
     Formae agent on GCP - the "install formae into a production environment" example.
-    A long-running GCE VM (the analog of the AWS ECS Fargate task) runs the agent
-    container, reached privately over your Tailscale tailnet (no public ingress),
-    serving a trusted *.ts.net certificate with HTTP basic auth on top. Mirrors the
-    AWS `tailnet` mode: a private subnet + Cloud NAT for egress + a persistent disk
-    that keeps the tsnet machine identity across VM replacements.
+    One entrypoint, two secure access modes via --access (there is no plaintext option):
 
-    Cloud SQL Postgres (private IP) backs the agent, reached through the Cloud SQL
-    Auth Proxy (started alongside the agent on the VM, --private-ip) using the VM
-    service account (roles/cloudsql.client). A Private Service Access peering
-    (globalAddress + servicenetworking connection) gives the instance its private
-    IP, since the org policy constraints/sql.restrictPublicIp forbids public IPs.
+      public   Public, internet-facing global external HTTPS load balancer terminating
+               HTTPS with YOUR certificate (--cert-file/--key-file, or a pre-created
+               --cert-name), with HTTP basic auth on top. A GCE VM in an unmanaged
+               instance group is the backend; the VM never gets a public IP. Point your
+               DNS at the reserved global address the stack prints. GCP's analog of the
+               AWS `alb` mode.
 
-    Secrets (DB password, API basic-auth bcrypt hash, Tailscale auth key) live in
-    Secret Manager and are fetched by the VM at boot via its metadata token; they
-    are never placed in instance metadata.
+      tailnet  Private, reached only over your Tailscale tailnet - no public ingress.
+               The agent joins the tailnet (--ts-authkey) and serves a trusted *.ts.net
+               certificate. Private subnet + Cloud NAT for egress + a persistent disk
+               that keeps the tsnet machine identity across VM replacements.
 
-    Public HTTPS mode (the AWS `alb` equivalent) is not yet offered: a GCE-VM-backed
-    external HTTPS load balancer needs instance-group membership management, which
-    the GCP plugin does not implement yet.
+    Both modes: a long-running GCE VM (the analog of the AWS ECS Fargate task) runs the
+    agent container. Cloud SQL Postgres (private IP) backs the agent, reached through the
+    Cloud SQL Auth Proxy (started alongside the agent on the VM, --private-ip) using the VM
+    service account (roles/cloudsql.client). A Private Service Access peering (globalAddress
+    + servicenetworking connection) gives the instance its private IP, since the org policy
+    constraints/sql.restrictPublicIp forbids public IPs.
+
+    Secrets (DB password, API basic-auth bcrypt hash, and - tailnet only - the Tailscale
+    auth key) live in Secret Manager and are fetched by the VM at boot via its metadata
+    token; they are never placed in instance metadata.
     """
     confirm = true
 }
@@ -70,6 +83,12 @@ properties {
     zone = new formae.Prop {
         flag = "zone"
         default = vars.zone
+    }
+    // Access mode: "public" (public HTTPS LB + basic auth) or "tailnet" (private,
+    // Tailscale). Defaults to tailnet to preserve the prior single-mode behavior.
+    access = new formae.Prop {
+        flag = "access"
+        default = "tailnet"
     }
     // GCE t-shirt size; maps to a machine type (see sizing.pkl).
     size = new formae.Prop {
@@ -98,8 +117,37 @@ properties {
         flag = "db-password"
         default = ""
     }
-    // A reusable Tailscale auth key (tagged tag:formae). Stored in Secret Manager;
-    // the agent joins the tailnet with it.
+
+    // ── public mode ───────────────────────────────────────────────────────────
+    // Name of a pre-created global SslCertificate to reference on the HTTPS proxy.
+    // The AWS --cert-arn analog: keeps the private key out of formae entirely.
+    // Mutually exclusive with --cert-file/--key-file.
+    certName = new formae.Prop {
+        flag = "cert-name"
+        default = ""
+    }
+    // Path to a PEM certificate chain (read at apply time). Creates a SELF_MANAGED
+    // SslCertificate in-stack. Requires --key-file.
+    certFile = new formae.Prop {
+        flag = "cert-file"
+        default = ""
+    }
+    // Path to the matching PEM private key (read at apply time, stored opaque so it
+    // never lands readably in plans/state).
+    keyFile = new formae.Prop {
+        flag = "key-file"
+        default = ""
+    }
+    // The hostname clients connect to (must match the certificate). Informational:
+    // point its DNS A record at the reserved global address the stack prints.
+    domain = new formae.Prop {
+        flag = "domain"
+        default = ""
+    }
+
+    // ── tailnet mode ──────────────────────────────────────────────────────────
+    // A reusable Tailscale auth key (tagged tag:formae). Required for --access tailnet.
+    // Stored in Secret Manager; the agent joins the tailnet with it.
     tsAuthkey = new formae.Prop {
         flag = "ts-authkey"
         default = ""
@@ -115,18 +163,66 @@ properties {
     }
 }
 
+// ── Mode + validation ─────────────────────────────────────────────────────────
+// AWS-style fail-fast validation: reject cross-mode flags and missing cert inputs
+// with clear messages before any slow cloud round-trip.
+local access =
+    let (a = properties.access.value)
+        if (a != "public" && a != "tailnet")
+            throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
+        else if (a == "tailnet" && (properties.certName.value != "" || properties.certFile.value != "" || properties.keyFile.value != "" || properties.domain.value != ""))
+            throw("--cert-name, --cert-file, --key-file and --domain apply only to --access public")
+        else if (a == "public" && (properties.tsAuthkey.value != "" || properties.tsHostname.value != ""))
+            throw("--ts-authkey and --ts-hostname apply only to --access tailnet")
+        else a
+
+local isPublic = access == "public"
+local isTailnet = access == "tailnet"
+
+// Cert inputs (public only): exactly one of --cert-name XOR (--cert-file AND --key-file).
+local certNameVal = properties.certName.value
+local certFileVal = properties.certFile.value
+local keyFileVal = properties.keyFile.value
+local useSelfManagedCert = certFileVal != "" && keyFileVal != ""
+local certValidated =
+    if (!isPublic) true
+    else if (certNameVal != "" && (certFileVal != "" || keyFileVal != ""))
+        throw("--cert-name is mutually exclusive with --cert-file/--key-file")
+    else if (certNameVal == "" && certFileVal == "" && keyFileVal == "")
+        throw("--access public requires either --cert-name or both --cert-file and --key-file")
+    else if (certFileVal != "" && keyFileVal == "")
+        throw("--cert-file requires --key-file (the matching PEM private key)")
+    else if (keyFileVal != "" && certFileVal == "")
+        throw("--key-file requires --cert-file (the matching PEM certificate chain)")
+    else true
+
+// Read PEM material only on the self-managed path (Pkl is lazy, so read() fires
+// only when useSelfManagedCert is true). Verified: formae's evaluator permits
+// read() of local files. Pass absolute paths (or paths relative to gcp/).
+local certPem = if (useSelfManagedCert) read(certFileVal).text else ""
+local keyPem = if (useSelfManagedCert) read(keyFileVal).text else ""
+
+// Validate CIDR shape early (clearer than a slow GCP round-trip).
+local cidrRegex = Regex(#"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"#)
+local function asCidr(value: String, flag: String): String =
+    if (value.matches(cidrRegex)) value
+    else throw("\(flag) must be a CIDR like 10.0.0.0/16, got: \(value)")
+local subnetCidrVal = asCidr(properties.subnetCidr.value, "--subnet-cidr")
+
 // ── Required inputs ───────────────────────────────────────────────────────────
 local projectVal =
     if (properties.project.value == "") throw("--project is required (the GCP project ID)")
     else properties.project.value
 local apiPasswordHashVal =
-    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required. Generate it with gcp/scripts/gen-api-credential.sh")
+    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required (both modes). Generate it with gcp/scripts/gen-api-credential.sh")
     else properties.apiPasswordHash.value
 local dbPasswordVal =
     if (properties.dbPassword.value == "") throw("--db-password is required (a stable Cloud SQL postgres password; gen-api-credential.sh prints one)")
     else properties.dbPassword.value
+// tsAuthkey is referenced only under tailnet, so this throw fires only then.
 local tsAuthkeyVal =
-    if (properties.tsAuthkey.value == "") throw("--ts-authkey is required (a reusable Tailscale auth key)")
+    if (!isTailnet) ""
+    else if (properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
     else properties.tsAuthkey.value
 
 local n = properties.name.value
@@ -138,6 +234,9 @@ local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.t
 local dbInstanceName = "\(n)-db"
 local dbConnName = "\(projectVal):\(regionVal):\(dbInstanceName)"
 
+// Force the cert validation to evaluate even when nothing else references it.
+local _certGate = certValidated
+
 // Every bootstrap-tier resource carries the app=formae-agent label so the agent's
 // own discovery filter (emitted into the config below) can suppress this stack's
 // substrate rather than surfacing it as unmanaged drift.
@@ -146,15 +245,12 @@ local commonLabels: Mapping<String, String> = new {
 }
 
 // ── Agent config file (written on the VM by the startup script) ───────────────
-// tailnet mode: auth-basic + server + postgres datastore (via the local Cloud SQL
-// Auth Proxy on 127.0.0.1:5432) + background work + a top-level tailscale network
-// block. $FORMAE_* / $TAILSCALE_AUTHKEY expand from the env the startup script
-// exports (fetched from Secret Manager); \(…) are Pkl interpolations at apply.
-local agentConfig = """
-amends "formae:/Config.pkl"
-import "plugins:/Gcp.pkl" as Gcp
-import "plugins:/AuthBasic.pkl" as AuthBasic
-agent {
+// Shared agent body: auth-basic (both modes) + server + postgres datastore (via the
+// local Cloud SQL Auth Proxy on 127.0.0.1:5432) + background work + discovery filter.
+// public wraps it as-is (LB terminates TLS, agent serves HTTP); tailnet adds the
+// top-level tailscale network block. $FORMAE_* / $TAILSCALE_AUTHKEY expand from the
+// env the startup script exports; \(…) are Pkl interpolations at apply.
+local agentBody = """
   auth = new AuthBasic.AgentConfig {
     authorizedUsers {
       new AuthBasic.AuthorizedUser {
@@ -203,7 +299,22 @@ agent {
       }
     }
   }
-}
+"""
+
+local publicAgentConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Gcp.pkl" as Gcp
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+\(agentBody)}
+"""
+
+local tailnetAgentConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Gcp.pkl" as Gcp
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+\(agentBody)}
 network = new NetworkConfig {
   type = "tailscale"
   tailscale = new TailscaleConfig {
@@ -215,15 +326,18 @@ network = new NetworkConfig {
 }
 """
 
-// ── VM startup script (Container-Optimized OS) ────────────────────────────────
-// Fetches secrets via the metadata access token (no gcloud on COS), mounts the
-// tsnet identity disk, starts the Cloud SQL Auth Proxy, writes the agent config,
-// and starts the agent container joined to the tailnet.
+local agentConfig = if (isPublic) publicAgentConfig else tailnetAgentConfig
+
+// ── VM startup scripts (Container-Optimized OS) ───────────────────────────────
+// Both fetch secrets via the metadata access token (no gcloud on COS), start the
+// Cloud SQL Auth Proxy, write the agent config, and start the agent container.
+// tailnet additionally mounts the persistent tsnet identity disk and joins the
+// tailnet; public serves plain HTTP behind the LB (which terminates TLS).
 //
-// NOTE: this runtime path (COS + docker + proxy + tsnet identity on a mounted
-// disk) is best-effort and must be validated with a real `formae apply`; the JSON
-// parsing is sed-based to avoid depending on jq/python being present on COS.
-local startupScript = """
+// NOTE: this runtime path (COS + docker + proxy) is best-effort and must be
+// validated with a real `formae apply`; JSON parsing is sed-based to avoid
+// depending on jq/python being present on COS.
+local scriptPrelude = """
 #!/bin/bash
 set -euo pipefail
 PROJECT="\(projectVal)"
@@ -241,31 +355,13 @@ getsecret() {
 }
 export FORMAE_DB_PASSWORD="$(getsecret \(n)-db-password)"
 export FORMAE_API_PASSWORD_HASH="$(getsecret \(n)-api-credential)"
-export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
-
-# The agent's "formae" database is created by the GCP::SQL::Database resource
-# (formaeDb), not here. The agent retries connecting until the instance is ready.
 
 # Retry transient ops: Cloud NAT egress may not be ready at first boot and
 # registry pulls (ghcr.io) can time out. 6 tries x 10s.
 retry() { local n=0; until "$@"; do n=$((n+1)); [ "$n" -ge 6 ] && return 1; echo "retry $n: $*"; sleep 10; done; }
 
-# Persistent tsnet identity disk (deviceName=tsnet). Wait for the by-id symlink
-# (udev races the startup script), format on first use, mount idempotently
-# (this script re-runs on every boot).
-TSDEV=/dev/disk/by-id/google-tsnet
-for i in $(seq 1 30); do [ -b "$TSDEV" ] && break; sleep 2; done
-if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
-# COS has a read-only root (/mnt is not writable); /var is the stateful mount.
-mkdir -p /var/lib/tsnet
-mountpoint -q /var/lib/tsnet || mount "$TSDEV" /var/lib/tsnet
-# The agent container runs as non-root 'pel'; the freshly-formatted disk is
-# root-owned, so make the tsnet state dir writable or tsnet.Up cannot persist.
-chmod 0777 /var/lib/tsnet
-
 # Cloud SQL Auth Proxy: listens on 127.0.0.1:5432, authenticates via the VM SA.
 # --private-ip dials the instance's private IP over the VPC (no public IP exists).
-# rm -f first so a reboot re-creates the container instead of hitting a name clash.
 CSQL_IMAGE="gcr.io/cloud-sql-connectors/cloud-sql-proxy:latest"
 retry docker pull "$CSQL_IMAGE"
 docker rm -f cloudsql-proxy >/dev/null 2>&1 || true
@@ -273,17 +369,38 @@ docker run -d --restart always --name cloudsql-proxy --network host \\
   "$CSQL_IMAGE" \\
   --address 0.0.0.0 --port 5432 --private-ip "\(dbConnName)"
 
-# Agent config, then the agent container (joins the tailnet, persists identity).
+# Agent config.
 mkdir -p /var/formae
-# Unquoted heredoc: the shell expands $FORMAE_DB_PASSWORD / $FORMAE_API_PASSWORD_HASH /
-# $TAILSCALE_AUTHKEY into the file (formae does not expand env vars in config).
 cat > /var/formae/formae.conf.pkl << PKLEOF
 \(agentConfig)
 PKLEOF
-
 FORMAE_IMAGE="\(properties.formaeImage.value)"
 retry docker pull "$FORMAE_IMAGE"
 docker rm -f formae-agent >/dev/null 2>&1 || true
+"""
+
+// public: no tsnet identity, no tailscale authkey; agent serves HTTP behind the LB.
+local publicStartup = scriptPrelude + """
+docker run -d --restart always --name formae-agent --network host \\
+  -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
+  -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH \\
+  "$FORMAE_IMAGE" \\
+  formae agent start --config /home/pel/.config/formae/formae.conf.pkl
+"""
+
+// tailnet: mount the persistent tsnet identity disk, join the tailnet.
+local tailnetStartup = scriptPrelude + """
+export TAILSCALE_AUTHKEY="$(getsecret \(n)-ts-authkey)"
+
+# Persistent tsnet identity disk (deviceName=tsnet). Wait for the by-id symlink
+# (udev races the startup script), format on first use, mount idempotently.
+TSDEV=/dev/disk/by-id/google-tsnet
+for i in $(seq 1 30); do [ -b "$TSDEV" ] && break; sleep 2; done
+if ! blkid "$TSDEV" >/dev/null 2>&1; then mkfs.ext4 -F "$TSDEV"; fi
+mkdir -p /var/lib/tsnet
+mountpoint -q /var/lib/tsnet || mount "$TSDEV" /var/lib/tsnet
+chmod 0777 /var/lib/tsnet
+
 docker run -d --restart always --name formae-agent --network host \\
   -v /var/lib/tsnet:/home/pel/.config/tsnet-formae \\
   -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
@@ -291,6 +408,29 @@ docker run -d --restart always --name formae-agent --network host \\
   "$FORMAE_IMAGE" \\
   formae agent start --config /home/pel/.config/formae/formae.conf.pkl
 """
+
+local startupScript = if (isPublic) publicStartup else tailnetStartup
+
+// VM disks differ by mode: tailnet also attaches the persistent tsnet identity disk.
+local agentDisks: Listing<instance.AttachedDisk> =
+    if (isPublic) new {
+        new instance.AttachedDisk {
+            boot = true
+            source = bootDisk.res.selfLink
+            autoDelete = true
+        }
+    } else new {
+        new instance.AttachedDisk {
+            boot = true
+            source = bootDisk.res.selfLink
+            autoDelete = true
+        }
+        new instance.AttachedDisk {
+            source = tsnetDisk.res.selfLink
+            autoDelete = false
+            deviceName = "tsnet"
+        }
+    }
 
 // ── Manifest ──────────────────────────────────────────────────────────────────
 forma {
@@ -304,7 +444,7 @@ forma {
         }
     }
 
-    // networking
+    // networking (shared)
     vpcNetwork
     subnet
     natRouter
@@ -312,27 +452,50 @@ forma {
     psaRange
     psaConn
 
-    // identity + access
+    // identity + access (shared)
     agentSa
     saCloudSql
     saSecrets
     saEditor
     saIamAdmin
 
-    // database + secrets
+    // database + shared secrets
     db
     formaeDb
     dbSecret
     dbSecretVersion
     apiSecret
     apiSecretVersion
-    tsSecret
-    tsSecretVersion
 
-    // compute
-    tsnetDisk
+    // compute (shared)
     bootDisk
     agentVm
+
+    // tailnet: persistent tsnet identity disk + Tailscale auth key secret
+    when (isTailnet) {
+        tsnetDisk
+        tsSecret
+        tsSecretVersion
+    }
+
+    // public: global external HTTPS load balancer in front of the VM, in
+    // dependency order (address + health check + firewall, then the backend
+    // chain: instance group -> backend service -> url map -> proxy -> rule).
+    when (isPublic) {
+        lbAddress
+        hc
+        gfeFirewall
+        ig
+        bs
+        um
+        proxy
+        fr
+    }
+    // Only the --cert-file path creates an in-stack SELF_MANAGED certificate;
+    // --cert-name references a pre-created one by name on the proxy.
+    when (isPublic && useSelfManagedCert) {
+        sslCert
+    }
 }
 
 // ── Networking ──────────────────────────────────────────────────────────────
@@ -347,7 +510,7 @@ local subnet = new subnetwork.Subnetwork {
     name = "\(n)-subnet"
     network = vpcNetwork.res.selfLink
     region = regionVal
-    ipCidrRange = properties.subnetCidr.value
+    ipCidrRange = subnetCidrVal
     // Lets the VM reach Google APIs (Secret Manager, Cloud SQL) without a public IP.
     privateIpGoogleAccess = true
 }
@@ -458,7 +621,7 @@ local db = new database.DatabaseInstance {
 
 // The agent's application database. A fresh Cloud SQL instance ships only the
 // engine's default database; this creates the "formae" database the agent
-// connects to (replaces the old startup-script Admin API curl).
+// connects to.
 local formaeDb = new sqlDatabase.Database {
     label = "\(n)-database"
     project = projectVal
@@ -489,6 +652,7 @@ local apiSecretVersion = new secretVersion.SecretVersion {
     data = apiPasswordHashVal
 }
 
+// tailnet only: the Tailscale auth key secret.
 local tsSecret = new secret.Secret {
     label = "\(n)-ts-secret"
     name = "\(n)-ts-authkey"
@@ -502,7 +666,7 @@ local tsSecretVersion = new secretVersion.SecretVersion {
 
 // ── Compute ─────────────────────────────────────────────────────────────────
 // Persistent identity disk (EFS analog): survives VM replacement so the agent
-// keeps its tsnet machine identity (autoDelete=false on the attachment).
+// keeps its tsnet machine identity (autoDelete=false on the attachment). tailnet only.
 local tsnetDisk = new disk.Disk {
     label = "\(n)-tsnet-disk"
     project = projectVal
@@ -535,23 +699,10 @@ local agentVm = new instance.Instance {
     name = "\(n)-agent"
     machineType = machineTypeVal
     labels = commonLabels
-    disks {
-        new instance.AttachedDisk {
-            boot = true
-            source = bootDisk.res.selfLink
-            autoDelete = true
-        }
-        new instance.AttachedDisk {
-            source = tsnetDisk.res.selfLink
-            autoDelete = false
-            // Stable device name => /dev/disk/by-id/google-tsnet, which the
-            // startup script formats/mounts for the persistent tsnet identity.
-            deviceName = "tsnet"
-        }
-    }
+    disks = agentDisks
     networkInterfaces {
-        // No accessConfigs => no external IP. Egress via Cloud NAT; reached over
-        // the tailnet.
+        // No accessConfigs => no external IP in either mode. Egress via Cloud NAT;
+        // reached over the tailnet (tailnet) or via the LB backend (public).
         new instance.NetworkInterface {
             network = vpcNetwork.res.selfLink
             subnetwork = subnet.res.selfLink
@@ -571,4 +722,113 @@ local agentVm = new instance.Instance {
             }
         }
     }
+}
+
+// ── Public mode: global external HTTPS load balancer ──────────────────────────
+// Reserved anycast IPv4 the operator points DNS at. Plain external address (no
+// purpose/network - those are the PSA fields).
+local lbAddress = new globalAddress.GlobalAddress {
+    label = "\(n)-lb-address"
+    name = "\(n)-lb-address"
+    addressType = "EXTERNAL"
+}
+
+// SELF_MANAGED cert from the operator's PEMs (only on the --cert-file path). The
+// private key is wrapped opaque so it never lands readably in plans/state.
+local sslCert = new sslCertificate.SslCertificate {
+    label = "\(n)-cert"
+    name = "\(n)-cert"
+    type = "SELF_MANAGED"
+    certificate = certPem
+    privateKey = formae.value(keyPem).opaque
+}
+
+// Certificates the HTTPS proxy presents: the in-stack cert (self-managed path) or
+// the pre-created cert referenced by name (--cert-name path).
+local proxySslCerts: Listing<String|formae.Resolvable> =
+    if (useSelfManagedCert) new { sslCert.res.selfLink }
+    else new { certNameVal }
+
+// Health check the backend service uses. Hits the agent's basic-auth-exempt
+// /api/v1/health on the formae port.
+local hc = new healthCheck.HealthCheck {
+    label = "\(n)-hc"
+    name = "\(n)-hc"
+    type = "HTTP"
+    httpHealthCheck = new healthCheck.HttpHealthCheck {
+        port = vars.formaePort
+        requestPath = "/api/v1/health"
+    }
+}
+
+// Admit Google front-end health-check + proxy traffic to the formae port, scoped
+// to the agent VM's service account.
+local gfeFirewall = new firewall.Firewall {
+    label = "\(n)-gfe-fw"
+    name = "\(n)-allow-gfe"
+    network = vpcNetwork.res.selfLink
+    direction = "INGRESS"
+    sourceRanges = new Listing { "130.211.0.0/22"; "35.191.0.0/16" }
+    targetServiceAccounts = new Listing { saEmail }
+    allowed = new Listing {
+        new firewall.Rule {
+            protocol = "tcp"
+            ports = new Listing { "\(vars.formaePort)" }
+        }
+    }
+}
+
+// Unmanaged zonal instance group holding the agent VM, with the named port the
+// backend service references. Requires the plugin's instance-group membership
+// support (feat/instance-group-membership, plugin dev tag).
+local ig = new instanceGroup.InstanceGroup {
+    label = "\(n)-ig"
+    name = "\(n)-ig"
+    zone = zoneVal
+    network = vpcNetwork.res.selfLink
+    subnetwork = subnet.res.selfLink
+    namedPorts = new Listing {
+        new instanceGroup.NamedPort {
+            name = "formae"
+            port = vars.formaePort
+        }
+    }
+    instances = new Listing { agentVm.res.selfLink }
+}
+
+local bs = new backendService.BackendService {
+    label = "\(n)-bs"
+    name = "\(n)-bs"
+    protocol = "HTTP"
+    portName = "formae"
+    loadBalancingScheme = "EXTERNAL_MANAGED"
+    healthChecks = new Listing { hc.res.selfLink }
+    backends = new Listing {
+        new backendService.Backend {
+            group = ig.res.selfLink
+        }
+    }
+}
+
+local um = new urlMap.UrlMap {
+    label = "\(n)-um"
+    name = "\(n)-um"
+    defaultService = bs.res.selfLink
+}
+
+local proxy = new targetHttpsProxy.TargetHttpsProxy {
+    label = "\(n)-proxy"
+    name = "\(n)-proxy"
+    urlMap = um.res.selfLink
+    sslCertificates = proxySslCerts
+}
+
+local fr = new globalForwardingRule.GlobalForwardingRule {
+    label = "\(n)-fr"
+    name = "\(n)-fr"
+    IPAddress = lbAddress.res.address
+    portRange = "443"
+    targetProxy = proxy.res.selfLink
+    // Must match the backend service scheme end-to-end.
+    loadBalancingScheme = "EXTERNAL_MANAGED"
 }
