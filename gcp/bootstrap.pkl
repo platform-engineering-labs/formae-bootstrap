@@ -376,6 +376,12 @@ docker run -d --restart always --name cloudsql-proxy --network host \\
   "$CSQL_IMAGE" \\
   --address 0.0.0.0 --port 5432 --private-ip "\(dbConnName)"
 
+# Wait for the proxy to actually accept connections before starting the agent.
+# `docker run -d` returns before the proxy is listening; starting the agent into
+# a not-yet-ready proxy races its first DB connect (observed leaving no agent
+# container after boot). 60s cap, then proceed and let the agent retry.
+for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null && { exec 3>&- 3<&-; break; }; sleep 2; done
+
 # Agent config.
 mkdir -p /var/formae
 cat > /var/formae/formae.conf.pkl << PKLEOF
@@ -388,6 +394,14 @@ docker rm -f formae-agent >/dev/null 2>&1 || true
 
 // public: no tsnet identity, no tailscale authkey; agent serves HTTP behind the LB.
 local publicStartup = scriptPrelude + """
+# Open the formae port in the guest OS firewall. Container-Optimized OS defaults
+# to `-P INPUT DROP` allowing only loopback/ICMP/established/SSH, so the load
+# balancer's health checks + traffic (from Google front-end ranges 130.211.0.0/22
+# and 35.191.0.0/16) are dropped and the backend never reports healthy. The VPC
+# firewall admitting those ranges is necessary but not sufficient — the guest
+# must accept the port too. Idempotent (-C guard); re-runs on every boot.
+iptables -C INPUT -p tcp --dport \(vars.formaePort) -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport \(vars.formaePort) -j ACCEPT
+
 docker run -d --restart always --name formae-agent --network host \\
   -v /var/formae/formae.conf.pkl:/home/pel/.config/formae/formae.conf.pkl \\
   -e FORMAE_DB_PASSWORD -e FORMAE_API_PASSWORD_HASH \\
