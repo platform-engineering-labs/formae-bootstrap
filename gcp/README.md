@@ -4,10 +4,11 @@ One command stands up a production **formae agent** on GCP — a VPC, a GCE VM r
 the agent container, and a Cloud SQL PostgreSQL database — secure by default. Two
 access modes via `--access` (there is no plaintext option):
 
-- **`public`** — a global external HTTPS load balancer terminating HTTPS with **your**
-  certificate (`--cert-file`/`--key-file`, or a pre-created `--cert-name`), with HTTP
+- **`public`** — a global external HTTPS load balancer terminating HTTPS, with HTTP
   basic auth on top. The agent VM never gets a public IP; the load balancer is the only
-  ingress. GCP's analog of the AWS `alb` mode.
+  ingress. GCP's analog of the AWS `alb` mode. Three ways to supply the certificate:
+  `--domain` (Google-managed, auto-provisioned + auto-renewed — recommended), a pre-created
+  `--cert-name`, or your own PEM via `--cert-file`/`--key-file`.
 - **`tailnet`** (default) — private, reached only over your Tailscale tailnet (no public
   ingress), serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
 
@@ -78,30 +79,38 @@ gcp/scripts/write-bootstrap-profile.sh --profile bootstrap \
 formae status agent --profile bootstrap
 ```
 
-**`public`** (public HTTPS load balancer with your certificate):
+**`public`** (public HTTPS load balancer). Recommended: a **Google-managed certificate** —
+pass `--domain` and Google provisions and auto-renews a publicly-trusted cert. No cert
+files, no renewal to manage:
 
 ```bash
-# Bring your own PEM cert + key (self-signed is fine for a smoke test):
 formae apply --mode reconcile gcp/bootstrap.pkl --access public \
   --project <project> \
-  --cert-file ./fullchain.pem --key-file ./privkey.pem \
   --domain formae.example.com \
   --api-user formae --api-password-hash '<hash>' \
   --db-password '<db-password>' \
   --watch
-
-# ...or reference a certificate you pre-created in the project:
-#   --cert-name my-existing-cert   (instead of --cert-file/--key-file)
-
-# Point your DNS A record at the reserved global address the stack prints, then:
-curl -u formae:'<password>' https://formae.example.com/api/v1/agent
-# health check is basic-auth-exempt:
-curl https://formae.example.com/api/v1/health
 ```
 
-Pass **either** `--cert-name <existing>` **or** both `--cert-file` and `--key-file`
-(paths are read at apply time; give absolute paths or paths relative to `gcp/`). The
-private key is stored **opaque** — it never lands readably in plans or state.
+Then point `formae.example.com`'s DNS **A record at the reserved global address the stack
+prints**. The managed cert stays `PROVISIONING` until DNS resolves to the LB and Google
+validates ownership (~15–60 min); HTTPS works once it goes `ACTIVE`. Verify:
+
+```bash
+curl -u formae:'<password>' https://formae.example.com/api/v1/agent   # 200 through basic auth
+curl https://formae.example.com/api/v1/health                          # 200, auth-exempt
+curl https://formae.example.com/api/v1/agent                           # 401 without -u
+```
+
+Alternatives to `--domain`:
+- **Pre-created cert**: `--cert-name my-existing-cert` (e.g. a Certificate Manager / classic
+  SSL cert you already manage).
+- **Bring your own PEM**: `--cert-file ./fullchain.pem --key-file ./privkey.pem` (e.g. a
+  Let's Encrypt cert you issued with certbot). Paths are read at apply time (absolute, or
+  relative to `gcp/`); the private key is stored opaque and never lands readably in
+  plans/state.
+
+Pass exactly **one** of `--domain`, `--cert-name`, or `--cert-file`+`--key-file`.
 
 ## Flags
 
@@ -111,9 +120,9 @@ private key is stored **opaque** — it never lands readably in plans or state.
 | `--access` | no | `tailnet` | `public` (HTTPS LB) or `tailnet` (Tailscale) |
 | `--api-password-hash` | yes (both modes) | — | bcrypt hash from `gen-api-credential.sh` |
 | `--db-password` | yes (both modes) | — | stable Cloud SQL postgres password |
-| `--cert-name` | public: one of these two | — | name of a pre-created global `SslCertificate` |
-| `--cert-file` + `--key-file` | public: one of these two | — | PEM cert chain + key; creates a `SELF_MANAGED` cert in-stack (key stored opaque) |
-| `--domain` | no (public) | — | hostname clients connect to; point its DNS at the printed address |
+| `--domain` | public: one of these three | — | Google-managed cert for this hostname (auto-provisioned + renewed); also the DNS name to point at the LB |
+| `--cert-name` | public: one of these three | — | name of a pre-created global `SslCertificate` |
+| `--cert-file` + `--key-file` | public: one of these three | — | PEM cert chain + key; creates a `SELF_MANAGED` cert in-stack (key stored opaque) |
 | `--ts-authkey` | yes (tailnet) | — | reusable Tailscale auth key (`tag:formae`) |
 | `--ts-hostname` | no (tailnet) | `--name` | tailnet MagicDNS hostname |
 | `--name` | no | `formae-bootstrap` | resource name prefix |
@@ -127,8 +136,13 @@ Cross-mode flags are rejected fast: `--cert-*`/`--domain` throw under `tailnet`,
 
 ### Public mode notes
 
+- **Managed cert (recommended).** With `--domain`, the cert is a Google-managed
+  `SslCertificate`: publicly trusted, auto-provisioned, and auto-renewed. It only goes
+  `ACTIVE` once the domain's DNS `A` record resolves to the LB and Google validates
+  ownership (~15–60 min). No self-signed certs are offered.
 - **DNS.** The stack reserves a global anycast address and prints it; point your domain's
-  `A` record at it. For a smoke test without DNS, use `curl --resolve <domain>:443:<ip>`.
+  `A` record at it. (A managed cert requires real DNS — it cannot validate against
+  `--resolve` or a domain you don't control.)
 - **Firewall.** Google's health-check + front-end ranges `130.211.0.0/22` and
   `35.191.0.0/16` are admitted to the formae port (`49684`), scoped to the agent VM's
   service account — backends never report healthy without this rule.

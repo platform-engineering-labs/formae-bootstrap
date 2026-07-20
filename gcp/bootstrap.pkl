@@ -41,11 +41,12 @@ description {
     One entrypoint, two secure access modes via --access (there is no plaintext option):
 
       public   Public, internet-facing global external HTTPS load balancer terminating
-               HTTPS with YOUR certificate (--cert-file/--key-file, or a pre-created
-               --cert-name), with HTTP basic auth on top. A GCE VM in an unmanaged
-               instance group is the backend; the VM never gets a public IP. Point your
-               DNS at the reserved global address the stack prints. GCP's analog of the
-               AWS `alb` mode.
+               HTTPS, with HTTP basic auth on top. Certificate via one of: --domain (a
+               Google-managed, auto-renewing cert - recommended), --cert-name (a
+               pre-created cert), or --cert-file/--key-file (your own PEM). A GCE VM in an
+               unmanaged instance group is the backend; the VM never gets a public IP.
+               Point your DNS at the reserved global address the stack prints. GCP's
+               analog of the AWS `alb` mode.
 
       tailnet  Private, reached only over your Tailscale tailnet - no public ingress.
                The agent joins the tailnet (--ts-authkey) and serves a trusted *.ts.net
@@ -183,13 +184,22 @@ local isTailnet = access == "tailnet"
 local certNameVal = properties.certName.value
 local certFileVal = properties.certFile.value
 local keyFileVal = properties.keyFile.value
+local domainVal = properties.domain.value
+// Three cert sources under --access public (exactly one):
+//   --cert-file + --key-file -> in-stack SELF_MANAGED cert from your PEMs
+//   --cert-name              -> reference a pre-created cert by name
+//   --domain (only)          -> Google-managed cert (auto-provisioned + renewed)
 local useSelfManagedCert = certFileVal != "" && keyFileVal != ""
+local useManagedCert = !useSelfManagedCert && certNameVal == "" && domainVal != ""
+// Whether an in-stack SslCertificate resource is created (both self-managed and
+// managed paths create one; --cert-name references an existing cert instead).
+local useCertResource = useSelfManagedCert || useManagedCert
 local certValidated =
     if (!isPublic) true
     else if (certNameVal != "" && (certFileVal != "" || keyFileVal != ""))
         throw("--cert-name is mutually exclusive with --cert-file/--key-file")
-    else if (certNameVal == "" && certFileVal == "" && keyFileVal == "")
-        throw("--access public requires either --cert-name or both --cert-file and --key-file")
+    else if (certNameVal == "" && certFileVal == "" && keyFileVal == "" && domainVal == "")
+        throw("--access public needs a certificate: --domain (Google-managed), or --cert-file + --key-file (your PEM), or --cert-name (a pre-created cert)")
     else if (certFileVal != "" && keyFileVal == "")
         throw("--cert-file requires --key-file (the matching PEM private key)")
     else if (keyFileVal != "" && certFileVal == "")
@@ -233,9 +243,6 @@ local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.t
 // Cloud SQL connection name is deterministic: project:region:instance.
 local dbInstanceName = "\(n)-db"
 local dbConnName = "\(projectVal):\(regionVal):\(dbInstanceName)"
-
-// Force the cert validation to evaluate even when nothing else references it.
-local _certGate = certValidated
 
 // Every bootstrap-tier resource carries the app=formae-agent label so the agent's
 // own discovery filter (emitted into the config below) can suppress this stack's
@@ -493,7 +500,7 @@ forma {
     }
     // Only the --cert-file path creates an in-stack SELF_MANAGED certificate;
     // --cert-name references a pre-created one by name on the proxy.
-    when (isPublic && useSelfManagedCert) {
+    when (isPublic && useCertResource) {
         sslCert
     }
 }
@@ -733,21 +740,36 @@ local lbAddress = new globalAddress.GlobalAddress {
     addressType = "EXTERNAL"
 }
 
-// SELF_MANAGED cert from the operator's PEMs (only on the --cert-file path). The
-// private key is wrapped opaque so it never lands readably in plans/state.
-local sslCert = new sslCertificate.SslCertificate {
-    label = "\(n)-cert"
-    name = "\(n)-cert"
-    type = "SELF_MANAGED"
-    certificate = certPem
-    privateKey = formae.value(keyPem).opaque
-}
+// In-stack certificate, created for the --domain (MANAGED) and --cert-file
+// (SELF_MANAGED) paths. MANAGED: Google provisions and auto-renews a publicly
+// trusted cert for the domain (requires the domain's DNS A record to point at
+// lbAddress; provisioning takes ~15-60 min). SELF_MANAGED: the operator's PEMs,
+// with the private key wrapped opaque so it never lands readably in plans/state.
+local sslCert =
+    if (useManagedCert)
+        new sslCertificate.SslCertificate {
+            label = "\(n)-cert"
+            name = "\(n)-cert"
+            type = "MANAGED"
+            managedDomains = new Listing { domainVal }
+        }
+    else
+        new sslCertificate.SslCertificate {
+            label = "\(n)-cert"
+            name = "\(n)-cert"
+            type = "SELF_MANAGED"
+            certificate = certPem
+            privateKey = formae.value(keyPem).opaque
+        }
 
-// Certificates the HTTPS proxy presents: the in-stack cert (self-managed path) or
-// the pre-created cert referenced by name (--cert-name path).
+// Certificates the HTTPS proxy presents: the in-stack cert (managed or
+// self-managed path) or the pre-created cert referenced by name (--cert-name).
+// `certValidated &&` forces the cert-input validation to evaluate here (Pkl
+// locals are lazy; this expression is always reached under --access public
+// because the proxy is in the isPublic manifest block).
 local proxySslCerts: Listing<String|formae.Resolvable> =
-    if (useSelfManagedCert) new { sslCert.res.selfLink }
-    else new { certNameVal }
+    if (certValidated && certNameVal != "") new { certNameVal }
+    else new { sslCert.res.selfLink }
 
 // Health check the backend service uses. Hits the agent's basic-auth-exempt
 // /api/v1/health on the formae port.
