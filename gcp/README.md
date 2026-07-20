@@ -178,9 +178,11 @@ formae apply --mode destroy gcp/destroy-target.pkl
 - `GCP::Compute::InstanceGroup.instances` — VM membership reconcile (the backend group
   must contain the agent VM) — **merged to plugin `main`** (`#80`).
 - `GCP::Compute::SslCertificate.privateKey` accepts an opaque-wrapped value — **merged**.
-- `GCP::Compute::SslCertificate` SELF_MANAGED `selfManaged` nesting — **pending
-  [formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81)**;
-  only the `--cert-file`/`--key-file` path needs it (`--domain` and `--cert-name` do not).
+- `GCP::Compute::SslCertificate` SELF_MANAGED `selfManaged` nesting — **merged**
+  ([formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81));
+  the `--cert-file`/`--key-file` path needs it (`--domain` and `--cert-name` do not).
+
+All three now live on plugin `main`.
 
 Until a plugin release carrying these is published, `gcp/PklProject` points `["gcp"]` at a
 **local checkout** of plugin `main`. Before merging, cut a plugin release (e.g. `0.1.10`,
@@ -210,10 +212,10 @@ Teardown note).
   you issued with certbot, or any CA). This is GCP's
   [self-managed SSL certificate](https://docs.cloud.google.com/load-balancing/docs/ssl-certificates/self-managed-certs)
   flow: your uploaded certificate + private key become a `SELF_MANAGED`
-  `GCP::Compute::SslCertificate` in-stack, with the private key stored opaque. Requires
-  plugin fix
-  [formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81)
-  (SELF_MANAGED `selfManaged` nesting) to create the certificate.
+  `GCP::Compute::SslCertificate` in-stack, with the private key stored opaque. The
+  SELF_MANAGED `selfManaged` nesting fix
+  ([formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81))
+  is merged to plugin `main`.
 
 `pkl eval` / `formae apply --simulate` are clean for `tailnet` (default, unchanged) and
 all three public certificate paths.
