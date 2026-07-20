@@ -105,10 +105,10 @@ curl https://formae.example.com/api/v1/agent                           # 401 wit
 Alternatives to `--domain`:
 - **Pre-created cert**: `--cert-name my-existing-cert` (e.g. a Certificate Manager / classic
   SSL cert you already manage).
-- **Bring your own PEM**: `--cert-file ./fullchain.pem --key-file ./privkey.pem` (e.g. a
-  Let's Encrypt cert you issued with certbot). Paths are read at apply time (absolute, or
-  relative to `gcp/`); the private key is stored opaque and never lands readably in
-  plans/state.
+- **Bring your own PEM** ([self-managed cert](https://docs.cloud.google.com/load-balancing/docs/ssl-certificates/self-managed-certs)):
+  `--cert-file ./fullchain.pem --key-file ./privkey.pem` (e.g. a Let's Encrypt cert you
+  issued with certbot). Paths are read at apply time (absolute, or relative to `gcp/`);
+  the private key is stored opaque and never lands readably in plans/state.
 
 Pass exactly **one** of `--domain`, `--cert-name`, or `--cert-file`+`--key-file`.
 
@@ -207,8 +207,11 @@ Teardown note).
   exercised in the live run. Recommended.
 - `--cert-name` — reference a certificate you pre-created in the project.
 - `--cert-file` + `--key-file` — **bring your own PEM** (e.g. a Let's Encrypt certificate
-  you issued with certbot, or any CA). Creates a `SELF_MANAGED` certificate in-stack with
-  the private key stored opaque. Requires plugin fix
+  you issued with certbot, or any CA). This is GCP's
+  [self-managed SSL certificate](https://docs.cloud.google.com/load-balancing/docs/ssl-certificates/self-managed-certs)
+  flow: your uploaded certificate + private key become a `SELF_MANAGED`
+  `GCP::Compute::SslCertificate` in-stack, with the private key stored opaque. Requires
+  plugin fix
   [formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81)
   (SELF_MANAGED `selfManaged` nesting) to create the certificate.
 
