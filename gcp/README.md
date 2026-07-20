@@ -173,40 +173,50 @@ formae apply --mode destroy gcp/destroy-target.pkl
 
 ## Version dependency
 
-`--access public` depends on GCP plugin features added in the
-`feat/instance-group-membership` branch:
+`--access public` depends on GCP plugin features:
 
 - `GCP::Compute::InstanceGroup.instances` — VM membership reconcile (the backend group
-  must actually contain the agent VM);
-- `GCP::Compute::SslCertificate.privateKey` widened to accept an opaque-wrapped value.
+  must contain the agent VM) — **merged to plugin `main`** (`#80`).
+- `GCP::Compute::SslCertificate.privateKey` accepts an opaque-wrapped value — **merged**.
+- `GCP::Compute::SslCertificate` SELF_MANAGED `selfManaged` nesting — **pending
+  [formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81)**;
+  only the `--cert-file`/`--key-file` path needs it (`--domain` and `--cert-name` do not).
 
-Until those ship in a published hub release, `gcp/PklProject` points `["gcp"]` at a
-**local checkout** of that plugin branch. Before merging a public-mode change, cut the
-plugin dev tag (`0.1.9-dev.0` or later) and switch the pin to:
+Until a plugin release carrying these is published, `gcp/PklProject` points `["gcp"]` at a
+**local checkout** of plugin `main`. Before merging, cut a plugin release (e.g. `0.1.10`,
+after `#81`) and switch the pin to:
 
 ```pkl
-["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9-dev.0" }
+["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.10" }
 ```
 
 The `tailnet` mode has no such dependency and works against the current published plugin.
 
 ## Validation status
 
-`pkl eval` and `formae apply --simulate` are clean. A live apply created 15/19 resources
-including the running VM (network, NAT, disks, secrets, service account, IAM bindings all
-succeeded, in correct dependency order). Two blockers stop a full end-to-end run in the
-test environment; both are plugin/environment issues, not the forma:
+**`--access public` is validated live, end to end (2026-07-20).** Deployed to a real
+project with a Google-managed certificate for a real domain: 29/29 resources created,
+the global external load balancer served **trusted HTTPS** (managed cert `ACTIVE`),
+`/api/v1/health` returned `200` unauthenticated, and the agent API returned `401` without
+credentials and served through HTTP basic auth with them. `formae destroy` cleaned up
+(two passes — the Cloud SQL + PSA peering teardown is eventually consistent; see the
+Teardown note).
 
-1. **Cloud SQL.** The test org enforces `constraints/sql.restrictPublicIp`, which rejects
-   the public-IP + Auth-Proxy approach. The private-IP alternative needs Private Service
-   Access (a `servicenetworking` VPC-peering connection), which the GCP plugin does not
-   implement yet. Until the plugin supports PSA (or the org allows public IP), point the
-   agent at an **existing** database instead.
-2. **Re-apply idempotency.** network/subnetwork/disk references don't round-trip on read
-   (`.res.selfLink` renders a full `https://…` URL but GCP stores the `projects/…` path;
-   a boot-disk `sourceImage` *family* resolves to a specific image), so reconcile computes
-   spurious **replaces** of the subnet + boot disk, which fail while the VM is using them.
-   A plugin read-normalization fix is needed for clean upgrades.
+**All three certificate options are supported (bring-your-own or managed):**
+- `--domain` — Google-managed certificate, auto-provisioned and auto-renewed. The path
+  exercised in the live run. Recommended.
+- `--cert-name` — reference a certificate you pre-created in the project.
+- `--cert-file` + `--key-file` — **bring your own PEM** (e.g. a Let's Encrypt certificate
+  you issued with certbot, or any CA). Creates a `SELF_MANAGED` certificate in-stack with
+  the private key stored opaque. Requires plugin fix
+  [formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81)
+  (SELF_MANAGED `selfManaged` nesting) to create the certificate.
+
+`pkl eval` / `formae apply --simulate` are clean for `tailnet` (default, unchanged) and
+all three public certificate paths.
+
+The earlier tailnet-mode blockers (private-IP Cloud SQL, re-apply drift) are resolved on
+plugin `main` (Private Service Access support + read-back normalization landed).
 
 The **VM runtime path** (COS startup script: secret fetch, tsnet disk mount, Cloud SQL
 proxy, agent container on the tailnet) was not reached end-to-end because the DB never
