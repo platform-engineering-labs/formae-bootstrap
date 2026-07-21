@@ -18,6 +18,12 @@
 /// medium ~ 1,000-5,000 resources   (e2-medium,     2 vCPU-burst / 4 GB)
 /// large  ~ 5,000-10,000 resources  (e2-standard-2, 2 vCPU / 8 GB)
 /// xlarge ~ 10,000-20,000 resources (e2-standard-4, 4 vCPU / 16 GB)
+///
+/// Cloud Run (--compute cloudrun) maps the same t-shirt sizes to a legal
+/// cpu/memory pair. Cloud Run enforces its own valid combinations (e.g. memory
+/// > 4 GiB requires >= 2 vCPU, > 8 GiB requires >= 4 vCPU); the pairs below stay
+/// within those rules and honour the agent's ~2 GB memory floor (all plugins are
+/// loaded at once). cpu is in millicpu, memory in the Ki/Mi/Gi form Cloud Run wants.
 module bootstrap.gcp.sizing
 
 typealias Size = "small" | "medium" | "large" | "xlarge"
@@ -30,3 +36,17 @@ hidden table: Mapping<Size, String> = new {
 }
 
 function forSize(s: Size): String = table[s]
+
+class CloudRunLimits {
+    cpu: String
+    memory: String
+}
+
+hidden cloudrunTable: Mapping<Size, CloudRunLimits> = new {
+    ["small"]  = new { cpu = "1000m"; memory = "2Gi" }
+    ["medium"] = new { cpu = "2000m"; memory = "4Gi" }
+    ["large"]  = new { cpu = "4000m"; memory = "8Gi" }
+    ["xlarge"] = new { cpu = "8000m"; memory = "16Gi" }
+}
+
+function forSizeCloudrun(s: Size): CloudRunLimits = cloudrunTable[s]
