@@ -112,6 +112,51 @@ Alternatives to `--domain`:
 
 Pass exactly **one** of `--domain`, `--cert-name`, or `--cert-file`+`--key-file`.
 
+### Bring your own certificate
+
+Two ways to use your own certificate (any CA — a Let's Encrypt `fullchain.pem`/`privkey.pem`,
+or a self-signed pair for testing). Both create/reference a GCP
+[self-managed SSL certificate](https://docs.cloud.google.com/load-balancing/docs/ssl-certificates/self-managed-certs).
+
+**A. Let the bootstrap create it (`--cert-file`) — simplest:**
+```bash
+formae apply --mode reconcile gcp/bootstrap.pkl --access public \
+  --project <project> --cert-file ./fullchain.pem --key-file ./privkey.pem \
+  --api-user formae --api-password-hash '<hash>' --db-password '<pw>' --watch
+```
+The bootstrap uploads your PEM as a `SELF_MANAGED` `GCP::Compute::SslCertificate` in-stack
+(private key stored opaque).
+
+**B. Import it yourself, then reference it (`--cert-name`):**
+```bash
+# generate (self-signed example; use your real CA cert in production)
+openssl req -x509 -newkey rsa:2048 -nodes -days 90 \
+  -keyout key.pem -out cert.pem -subj "/CN=formae.example.com"
+
+# import into GCP
+gcloud compute ssl-certificates create my-cert \
+  --certificate=cert.pem --private-key=key.pem --global --project <project>
+
+# reference it (pass the full selfLink, not a bare name)
+CERT=$(gcloud compute ssl-certificates describe my-cert --global \
+  --project <project> --format='value(selfLink)')
+formae apply --mode reconcile gcp/bootstrap.pkl --access public \
+  --project <project> --cert-name "$CERT" \
+  --api-user formae --api-password-hash '<hash>' --db-password '<pw>' --watch
+```
+
+A self-managed certificate serves immediately (no domain-validation wait, unlike
+`--domain`). Point your DNS at the reserved LB address, or test without DNS:
+```bash
+IP=$(gcloud compute forwarding-rules describe <name>-fr --global --project <project> --format='value(IPAddress)')
+curl -k --resolve formae.example.com:443:$IP https://formae.example.com/api/v1/health   # 200
+```
+(`-k` only because a self-signed cert isn't publicly trusted; a real CA cert needs no `-k`.)
+
+> **Note on `--cert-name`:** pass the certificate's full **selfLink**
+> (`https://www.googleapis.com/compute/v1/projects/.../global/sslCertificates/NAME`), not a
+> bare name — the target HTTPS proxy resolves the resource URL, not a short name.
+
 ## Flags
 
 | Flag | Required | Default | Purpose |
