@@ -218,26 +218,15 @@ formae apply --mode destroy gcp/destroy-target.pkl
 
 ## Version dependency
 
-`--access public` depends on GCP plugin features:
-
-- `GCP::Compute::InstanceGroup.instances` — VM membership reconcile (the backend group
-  must contain the agent VM) — **merged to plugin `main`** (`#80`).
-- `GCP::Compute::SslCertificate.privateKey` accepts an opaque-wrapped value — **merged**.
-- `GCP::Compute::SslCertificate` SELF_MANAGED `selfManaged` nesting — **merged**
-  ([formae-plugin-gcp#81](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/81));
-  the `--cert-file`/`--key-file` path needs it (`--domain` and `--cert-name` do not).
-
-All three now live on plugin `main`.
-
-Until a plugin release carrying these is published, `gcp/PklProject` points `["gcp"]` at a
-**local checkout** of plugin `main`. Before merging, cut a plugin release (e.g. `0.1.10`,
-after `#81`) and switch the pin to:
+`--access public` needs **GCP plugin ≥ 0.1.9**, pinned in `gcp/PklProject`:
 
 ```pkl
-["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.10" }
+["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9" }
 ```
 
-The `tailnet` mode has no such dependency and works against the current published plugin.
+0.1.9 carries the features public mode relies on: `GCP::Compute::InstanceGroup.instances`
+(VM membership), `SslCertificate.privateKey` opaque-wrapping, and SELF_MANAGED
+`selfManaged` nesting (for `--cert-file`). The `tailnet` mode has no such dependency.
 
 ## Validation status
 

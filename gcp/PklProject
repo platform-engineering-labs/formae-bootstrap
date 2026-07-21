@@ -5,14 +5,7 @@ dependencies {
     uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.86.0"
   }
 
-  // DEV REFERENCE — points at a local checkout of the GCP plugin (main), which
-  // carries GCP::Compute::InstanceGroup.instances (VM membership) and the
-  // widened SslCertificate.privateKey that --access public needs. Merged to
-  // main but not yet published to the hub as a release.
-  //
-  // Before this bootstrap PR merges, replace this with the published pin once
-  // gcp 0.1.9 is released:
-  //   ["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9" }
-  // (see the README "Version dependency" note).
-  ["gcp"] = import("/Users/stheno/git/pel/plugins/formae-plugin-gcp/schema/pkl/PklProject")
+  ["gcp"] {
+    uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9"
+  }
 }
