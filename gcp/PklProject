@@ -6,6 +6,6 @@ dependencies {
   }
 
   ["gcp"] {
-    uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.8"
+    uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9"
   }
 }
