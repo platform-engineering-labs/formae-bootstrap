@@ -41,11 +41,17 @@ done
 
 [ -n "$profile" ] && [ -n "$password" ] || usage
 [ -n "$fqdn" ] || { echo "error: --fqdn is required (e.g. formae-bootstrap.eastus.cloudapp.azure.com)" >&2; exit 1; }
-case "$access" in public|tailnet) ;; *) echo "error: --access must be public or tailnet" >&2; exit 1 ;; esac
+case "$access" in public|appgw|tailnet) ;; *) echo "error: --access must be public, appgw or tailnet" >&2; exit 1 ;; esac
 
 skipverify=""
 if [ "$access" = "public" ]; then
     # Self-signed certificate: opt in to skipping verification (formae PR #540).
+    skipverify=$'\n        insecureSkipVerify = true'
+elif [ "$access" = "appgw" ]; then
+    # The Application Gateway listens on :443. Its cert is self-signed by default
+    # (skip verification); if you imported a trusted PFX (--cert-pfx), delete the
+    # insecureSkipVerify line below.
+    [ "$port" = "49684" ] && port="443"
     skipverify=$'\n        insecureSkipVerify = true'
 fi
 

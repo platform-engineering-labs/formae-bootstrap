@@ -22,6 +22,12 @@ import "@azure/dbforpostgresql/flexibleserver.pkl"
 import "@azure/dbforpostgresql/database.pkl"
 import "@azure/compute/virtualmachine.pkl"
 import "@azure/compute/virtualmachineextension.pkl"
+// appgw mode: public HTTPS via Application Gateway + a Key Vault certificate.
+import "@azure/network/applicationgateway.pkl"
+import "@azure/keyvault/vault.pkl"
+import "@azure/keyvault/certificate.pkl"
+import "@azure/managedidentity/userassignedidentity.pkl"
+import "@azure/authorization/roleassignment.pkl"
 
 import "./vars.pkl"
 import "./sizing.pkl"
@@ -30,13 +36,20 @@ description {
     text = """
     Formae agent on Azure - the "install formae into a production environment"
     example. A long-running VM (the analog of the AWS ECS Fargate task and the
-    GCP GCE VM) runs the agent container, in one of two access modes:
+    GCP GCE VM) runs the agent container, in one of three access modes:
 
     - `public`: the agent terminates HTTPS itself with a self-signed certificate
       generated on the VM at first boot (server.tlsCert/tlsKey), reachable at a
       stable <name>.<location>.cloudapp.azure.com FQDN. Basic auth on top;
       inbound restricted to --allowed-cidr. Connecting requires the CLI's
       cli.api.insecureSkipVerify knob (formae PR #540).
+    - `appgw`: public HTTPS terminated by an Application Gateway v2 in its own
+      subnet, fronting the VM (which serves plain HTTP on the API port, reached
+      only from the gateway subnet). The gateway's TLS cert is an
+      AZURE::KeyVault::Certificate the stack provisions in a Key Vault it creates
+      (self-signed by default, or your PFX via --cert-pfx), read at runtime via a
+      user-assigned identity granted "Key Vault Secrets User". Mirrors the AWS
+      `alb` mode (ALB + ACM). Point --domain's DNS at the gateway public IP.
     - `tailnet`: private, reached only over your Tailscale tailnet (no public
       inbound), serving a trusted *.ts.net certificate, with basic auth on top.
       Mirrors the AWS/GCP `tailnet` mode.
@@ -95,7 +108,8 @@ properties {
         flag = "size"
         default = "small"
     }
-    // `public` (self-signed HTTPS endpoint) or `tailnet` (private, Tailscale).
+    // `public` (self-signed), `appgw` (App Gateway + Key Vault cert), or
+    // `tailnet` (private, Tailscale).
     access = new formae.Prop {
         flag = "access"
         default = "public"
@@ -134,6 +148,37 @@ properties {
         flag = "allowed-cidr"
         default = "*"
     }
+    // appgw mode only: the hostname clients connect to (must match the cert's
+    // subject/SAN). Point its DNS at the Application Gateway's public IP.
+    domain = new formae.Prop {
+        flag = "domain"
+        default = ""
+    }
+    // appgw mode only: globally-unique Key Vault name (3-24 chars, alphanumeric +
+    // hyphen, starts with a letter). The stack creates this vault to hold the cert.
+    kvName = new formae.Prop {
+        flag = "kv-name"
+        default = ""
+    }
+    // appgw mode only: objectId (principal object ID, NOT the appId) of the
+    // principal running this apply — granted "Key Vault Certificates Officer" on
+    // the new vault so the plugin can create the certificate (data-plane). Find it
+    // with: az ad sp show --id <client-id> --query id -o tsv
+    applierObjectId = new formae.Prop {
+        flag = "applier-object-id"
+        default = ""
+    }
+    // appgw mode, optional: base64-encoded PFX to import as the gateway cert. When
+    // omitted, the stack issues a self-signed cert (works, but not browser-trusted).
+    certPfx = new formae.Prop {
+        flag = "cert-pfx"
+        default = ""
+    }
+    // appgw mode, optional: password for --cert-pfx.
+    certPassword = new formae.Prop {
+        flag = "cert-password"
+        default = ""
+    }
     // tailnet mode only: a reusable Tailscale auth key (tagged tag:formae).
     tsAuthkey = new formae.Prop {
         flag = "ts-authkey"
@@ -157,11 +202,25 @@ properties {
 // ── Required inputs ───────────────────────────────────────────────────────────
 local access =
     let (a = properties.access.value)
-    if (a != "public" && a != "tailnet")
-        throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
+    if (a != "public" && a != "appgw" && a != "tailnet")
+        throw("--access must be \"public\", \"appgw\" or \"tailnet\" (got \"\(a)\")")
     else a
 local isPublic = access == "public"
+local isAppgw = access == "appgw"
 local isTailnet = access == "tailnet"
+
+// appgw-mode required inputs (referenced only inside the appgw branch).
+local domainVal =
+    if (isAppgw && properties.domain.value == "") throw("--domain is required for --access appgw (the hostname clients connect to; point its DNS at the gateway public IP)")
+    else properties.domain.value
+local kvNameVal =
+    if (isAppgw && properties.kvName.value == "") throw("--kv-name is required for --access appgw (a globally-unique Key Vault name, 3-24 chars)")
+    else properties.kvName.value
+local applierObjectIdVal =
+    if (isAppgw && properties.applierObjectId.value == "") throw("--applier-object-id is required for --access appgw (objectId of the applying principal; az ad sp show --id <client-id> --query id -o tsv)")
+    else properties.applierObjectId.value
+local certPfxVal = properties.certPfx.value
+local certPasswordVal = properties.certPassword.value
 
 local subscriptionIdVal =
     if (properties.subscriptionId.value == "") throw("--subscription-id is required (the Azure subscription ID)")
@@ -306,7 +365,7 @@ local tlsSetup =
       -subj "/CN=\(agentFqdn)" -addext "subjectAltName=DNS:\(agentFqdn)"
     chmod 0644 /var/formae/tls.crt /var/formae/tls.key
     """
-    else """
+    else if (isTailnet) """
     # Persistent tsnet identity dir. Lives on the OS disk: the azure plugin has
     # no VM data-disk attachment yet, so the tailnet machine identity survives
     # reboots but NOT VM replacement (the node re-registers via the auth key;
@@ -315,10 +374,14 @@ local tlsSetup =
     # The agent container runs as non-root 'pel'; make the state dir writable.
     chmod 0777 /var/lib/tsnet
     """
+    // appgw mode: the Application Gateway terminates TLS, so the agent serves
+    // plain HTTP on the API port — no on-VM cert and no tsnet state to prepare.
+    else ""
 
 local dockerMounts =
     if (isPublic) "-v /var/formae/tls.crt:/home/pel/.config/formae/tls.crt -v /var/formae/tls.key:/home/pel/.config/formae/tls.key"
-    else "-v /var/lib/tsnet:/home/pel/.config/tsnet-formae"
+    else if (isTailnet) "-v /var/lib/tsnet:/home/pel/.config/tsnet-formae"
+    else ""
 
 local bootstrapScript = """
 #!/bin/bash
@@ -391,6 +454,19 @@ forma {
     // compute
     vm
     ext
+
+    // appgw mode: dedicated subnet + public IP + Key Vault + certificate +
+    // user-assigned identity (+ its vault role) + the Application Gateway.
+    when (isAppgw) {
+        appgwSubnet
+        appgwPip
+        kvVault
+        appgwIdentity
+        roleSecretsUser
+        roleCertsOfficer
+        cert
+        appgw
+    }
 }
 
 // ── Resource group + networking ───────────────────────────────────────────────
@@ -442,6 +518,21 @@ local nsg = new networksecuritygroup.NetworkSecurityGroup {
                 destinationPortRange = "\(vars.formaePort)"
             }
         }
+        // appgw mode: only the Application Gateway subnet may reach the API port;
+        // the internet reaches the gateway (:443), never the VM directly.
+        when (isAppgw) {
+            new networksecuritygroup.SecurityRule {
+                name = "allow-agent-api-from-appgw"
+                priority = 100
+                direction = "Inbound"
+                access = "Allow"
+                protocol = "Tcp"
+                sourceAddressPrefix = vars.appgwSubnetCidr
+                sourcePortRange = "*"
+                destinationAddressPrefix = "*"
+                destinationPortRange = "\(vars.formaePort)"
+            }
+        }
     }
     tags = commonTags
 }
@@ -470,7 +561,10 @@ local nic = new networkinterface.NetworkInterface {
             name = "primary"
             subnet = snet.res.id
             publicIPAddress = pip.res.id
-            privateIPAllocationMethod = "Dynamic"
+            // appgw mode: static private IP so the gateway backend pool can target
+            // the VM by address. Other modes: dynamic (nothing references it).
+            privateIPAllocationMethod = if (isAppgw) "Static" else "Dynamic"
+            privateIPAddress = if (isAppgw) vars.vmPrivateIp else null
             primary = true
         }
     }
@@ -616,6 +710,178 @@ local ext = new virtualmachineextension.VirtualMachineExtension {
     autoUpgradeMinorVersion = true
     protectedSettings = new Mapping {
         ["script"] = bootstrapScript.base64
+    }
+    tags = commonTags
+}
+
+// ── appgw mode: Application Gateway public-HTTPS ingress ───────────────────────
+// A dedicated subnet + Standard public IP front an Application Gateway v2 that
+// terminates TLS with a Key Vault certificate and forwards HTTP to the VM's
+// static private IP. The gateway reads the cert at runtime via a user-assigned
+// identity granted "Key Vault Secrets User" on the vault; the applying principal
+// is granted "Key Vault Certificates Officer" so the plugin can create the cert
+// (a data-plane operation). Mirrors the AWS `alb` mode.
+
+// App Gateway v2 requires its own subnet (no other resources in it).
+local appgwSubnet = new subnet.Subnet {
+    label = "\(n)-appgw-subnet"
+    name = "\(n)-appgw-subnet"
+    resourceGroupName = rg.res.name
+    virtualNetworkName = vnet.res.name
+    addressPrefix = vars.appgwSubnetCidr
+}
+
+local appgwPip = new publicipaddress.PublicIPAddress {
+    label = "\(n)-appgw-pip"
+    name = "\(n)-appgw-pip"
+    location = loc
+    resourceGroupName = rg.res.name
+    sku = new publicipaddress.PublicIPAddressSKU { name = "Standard" }
+    publicIPAllocationMethod = "Static"
+    dnsSettings = new publicipaddress.DnsSettings { domainNameLabel = "\(n)-gw" }
+    tags = commonTags
+}
+
+// RBAC-authorized vault: access is granted via role assignments below (an
+// access policy cannot take the identity's resolved principalId).
+local kvVault = new vault.Vault {
+    label = "\(n)-kv"
+    name = kvNameVal
+    location = loc
+    resourceGroupName = rg.res.name
+    tenantId = tenantIdVal
+    sku = new vault.VaultSKU { name = "standard" }
+    enableRbacAuthorization = true
+    tags = commonTags
+}
+
+local appgwIdentity = new userassignedidentity.UserAssignedIdentity {
+    label = "\(n)-appgw-id"
+    name = "\(n)-appgw-id"
+    location = loc
+    resourceGroupName = rg.res.name
+    tags = commonTags
+}
+
+// Built-in role: "Key Vault Secrets User" — lets the gateway identity read the
+// cert's secret (the PFX) at runtime.
+local roleSecretsUser = new roleassignment.RoleAssignment {
+    label = "\(n)-kv-secrets-user"
+    scope = kvVault.res.id
+    principalId = appgwIdentity.res.principalId
+    principalType = "ServicePrincipal"
+    roleDefinitionId = "/subscriptions/\(subscriptionIdVal)/providers/Microsoft.Authorization/roleDefinitions/4633458b-17de-408a-b874-0445c86b69e6"
+}
+
+// Built-in role: "Key Vault Certificates Officer" — lets the applying principal
+// create the certificate (a data-plane operation ARM Contributor does not grant).
+local roleCertsOfficer = new roleassignment.RoleAssignment {
+    label = "\(n)-kv-certs-officer"
+    scope = kvVault.res.id
+    principalId = applierObjectIdVal
+    roleDefinitionId = "/subscriptions/\(subscriptionIdVal)/providers/Microsoft.Authorization/roleDefinitions/a4417e6f-fecd-4de8-b567-7b0420556985"
+}
+
+// The gateway's TLS certificate. Self-signed by default (works, not browser
+// trusted); pass --cert-pfx (+ --cert-password) to import your own trusted PFX.
+local cert = new certificate.Certificate {
+    label = "\(n)-cert"
+    name = "agent-tls"
+    vaultUri = kvVault.res.vaultUri
+    data = if (certPfxVal != "") formae.value(certPfxVal).opaque else null
+    password = if (certPfxVal != "") formae.value(certPasswordVal).opaque else null
+    policy = if (certPfxVal == "") new certificate.Policy {
+        issuerName = "Self"
+        subject = "CN=\(domainVal)"
+        validityMonths = 12
+    } else null
+    tags = commonTags
+}
+
+local appgw = new applicationgateway.ApplicationGateway {
+    label = "\(n)-appgw"
+    name = "\(n)-appgw"
+    location = loc
+    resourceGroupName = rg.res.name
+    sku = new applicationgateway.ApplicationGatewaySKU {
+        name = "Standard_v2"
+        tier = "Standard_v2"
+        capacity = 1
+    }
+    identity = new applicationgateway.Identity {
+        type = "UserAssigned"
+        userAssignedIdentityIds { appgwIdentity.res.id }
+    }
+    gatewayIPConfigurations {
+        new applicationgateway.GatewayIPConfiguration {
+            name = "gwip"
+            subnetId = appgwSubnet.res.id
+        }
+    }
+    frontendIPConfigurations {
+        new applicationgateway.FrontendIPConfiguration {
+            name = "feip"
+            publicIPAddressId = appgwPip.res.id
+        }
+    }
+    frontendPorts {
+        new applicationgateway.FrontendPort { name = "https"; port = 443 }
+    }
+    sslCertificates {
+        new applicationgateway.SSLCertificate {
+            name = "agent-cert"
+            keyVaultSecretId = cert.res.secretId
+        }
+    }
+    backendAddressPools {
+        new applicationgateway.BackendAddressPool {
+            name = "agent-pool"
+            backendAddresses {
+                new applicationgateway.BackendAddress { ipAddress = vars.vmPrivateIp }
+            }
+        }
+    }
+    backendHttpSettingsCollection {
+        new applicationgateway.BackendHTTPSettings {
+            name = "agent-http"
+            port = vars.formaePort
+            protocol = "Http"
+            probeName = "agent-health"
+            requestTimeout = 30
+            cookieBasedAffinity = "Disabled"
+        }
+    }
+    httpListeners {
+        new applicationgateway.HTTPListener {
+            name = "l443"
+            frontendIPConfigurationName = "feip"
+            frontendPortName = "https"
+            protocol = "Https"
+            sslCertificateName = "agent-cert"
+            hostName = domainVal
+        }
+    }
+    requestRoutingRules {
+        new applicationgateway.RequestRoutingRule {
+            name = "r1"
+            ruleType = "Basic"
+            priority = 100
+            httpListenerName = "l443"
+            backendAddressPoolName = "agent-pool"
+            backendHTTPSettingsName = "agent-http"
+        }
+    }
+    probes {
+        new applicationgateway.Probe {
+            name = "agent-health"
+            protocol = "Http"
+            path = "/api/v1/health"
+            host = vars.vmPrivateIp
+            port = vars.formaePort
+            interval = 30
+            timeout = 30
+            unhealthyThreshold = 3
+        }
     }
     tags = commonTags
 }

@@ -5,7 +5,10 @@ dependencies {
     uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.87.0"
   }
 
+  // appgw mode needs App Gateway KV-cert wiring + KeyVault::Certificate + identity
+  // + role assignment, first released in the azure plugin 0.1.10. public/tailnet
+  // work with any 0.1.x. Bump to the exact published version at release time.
   ["azure"] {
-    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.7"
+    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.10"
   }
 }

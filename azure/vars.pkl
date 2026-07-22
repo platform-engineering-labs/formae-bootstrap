@@ -13,6 +13,12 @@ location = "eastus"
 vnetCidr = "10.100.0.0/16"
 // Subnet hosting the agent VM and the Postgres private endpoint.
 subnetCidr = "10.100.1.0/24"
+// appgw mode only: dedicated subnet for the Application Gateway (v2 requires its
+// own subnet, separate from the VM subnet).
+appgwSubnetCidr = "10.100.2.0/24"
+// appgw mode only: static private IP for the VM NIC so the Application Gateway
+// backend pool can target it by address. Must fall inside subnetCidr.
+vmPrivateIp = "10.100.1.4"
 
 // Azure Database for PostgreSQL Flexible Server.
 dbSkuName = "Standard_B1ms" // 1 vCPU / 2 GB

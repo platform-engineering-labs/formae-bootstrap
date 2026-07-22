@@ -2,13 +2,22 @@
 
 One command stands up a production **formae agent** on Azure — a resource group, a VM running
 the agent container, and an Azure Database for PostgreSQL Flexible Server (private endpoint,
-no public DB access) — secure by default, in one of two access modes:
+no public DB access) — secure by default, in one of three access modes:
 
 - **`public`** — the agent terminates HTTPS itself with a **self-signed certificate** generated
   on the VM at first boot, reachable at a stable `<name>.<location>.cloudapp.azure.com` FQDN,
   plus HTTP basic auth. Inbound restricted to `--allowed-cidr`.
+- **`appgw`** — public HTTPS terminated by an **Application Gateway v2** fronting the VM, with the
+  TLS cert stored as an **`AZURE::KeyVault::Certificate`** the stack provisions in a Key Vault it
+  creates (self-signed by default, or **your PFX** via `--cert-pfx`), read at runtime by a
+  user-assigned identity. The Azure analog of the AWS **`alb`** mode. Point `--domain`'s DNS at the
+  gateway's public IP; basic auth on top.
 - **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress), serving
   a trusted `*.ts.net` certificate, with basic auth on top.
+
+> **Requires the Azure plugin ≥ 0.1.10** (App Gateway KV-cert wiring, `AZURE::KeyVault::Certificate`,
+> user-assigned identity + role assignment). `appgw` mode will not resolve against older plugin
+> schemas. `public`/`tailnet` are unaffected.
 
 Formae runs as a client and an agent: you use your local install to provision the agent's
 permanent home in the cloud, then point your CLI at it with a profile and hand off.
@@ -33,6 +42,14 @@ permanent home in the cloud, then point your CLI at it with a profile and hand o
 - `public` mode: a formae CLI with `cli.api.insecureSkipVerify`
   ([formae PR #540](https://github.com/platform-engineering-labs/formae/pull/540)) to accept
   the self-signed certificate.
+- `appgw` mode:
+  - a **domain** you control (`--domain`) whose DNS you point at the gateway's public IP after apply;
+  - a **globally-unique Key Vault name** (`--kv-name`, 3–24 chars);
+  - the applying principal's **objectId** (`--applier-object-id`) so the stack can grant it
+    "Key Vault Certificates Officer" to create the cert (data-plane):
+    `az ad sp show --id <client-id> --query id -o tsv`;
+  - optionally a **PFX** (`--cert-pfx` base64 + `--cert-password`) for a browser-trusted cert;
+    omit for a self-signed cert (works, not trusted).
 - `tailnet` mode: a reusable Tailscale auth key tagged `tag:formae`, HTTPS certificates
   enabled in the tailnet admin console.
 
@@ -62,6 +79,30 @@ azure/scripts/write-bootstrap-profile.sh --profile bootstrap --access public \
   --fqdn formae-bootstrap.<location>.cloudapp.azure.com --user formae --password '<password>'
 formae status agent --profile bootstrap
 ```
+
+**`appgw`** (public HTTPS via Application Gateway + a Key Vault cert):
+
+```bash
+formae apply --mode reconcile azure/bootstrap.pkl --access appgw --location <location> \
+  --subscription-id <sub-id> --tenant-id <tenant-id> \
+  --client-id <sp-appId> --client-secret '<sp-password>' \
+  --domain agent.example.com --kv-name <unique-kv-name> \
+  --applier-object-id "$(az ad sp show --id <sp-appId> --query id -o tsv)" \
+  --api-user formae --api-password-hash '<hash>' --db-password '<dbpass>' \
+  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)" --watch
+  # add --cert-pfx "$(base64 -i cert.pfx)" --cert-password '<pw>' for a trusted cert
+
+# Point agent.example.com's DNS at the gateway public IP (formae-bootstrap-gw.<location>.cloudapp.azure.com),
+# then (self-signed cert: -k; trusted PFX: drop -k):
+curl -k https://agent.example.com/api/v1/health
+azure/scripts/write-bootstrap-profile.sh --profile bootstrap --access appgw \
+  --fqdn agent.example.com --user formae --password '<password>'
+formae status agent --profile bootstrap
+```
+
+> **First apply may report the route/cert resolving before RBAC has propagated.** Key Vault role
+> assignments take a minute or two to take effect; if the certificate create fails with a 403 on
+> the first apply, re-run the same command — it succeeds once the "Certificates Officer" grant lands.
 
 **`tailnet`**:
 
@@ -107,7 +148,7 @@ depends on it.
 
 | Flag | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `--access` | — | `public` | `public` (self-signed HTTPS) or `tailnet` |
+| `--access` | — | `public` | `public` (self-signed HTTPS), `appgw` (App Gateway + Key Vault cert), or `tailnet` |
 | `--location` | — | `eastus` | Azure region. Must accept new customers and offer PostgreSQL Flexible Server + the chosen VM size (see Troubleshooting) |
 | `--name` | — | `formae-bootstrap` | Prefix for every resource. **Must be globally unique** — it drives the PostgreSQL server FQDN (`<name>-db.postgres.database.azure.com`) and the public DNS label, both of which collide across subscriptions. Change it if the default is taken |
 | `--size` | — | `small` | `small`/`medium`/`large`/`xlarge` → Dsv6 VM sizes (see `sizing.pkl`; fresh subscriptions get 0 vCPU quota on B-series and v5 families, so Dsv6 is the default) |
@@ -117,6 +158,10 @@ depends on it.
 | `--db-password` | yes | — | Stable Postgres admin password. Reuse the **same** value on every re-apply |
 | `--ssh-public-key` | yes | — | Admin key on the VM (no inbound SSH rule is opened; see Troubleshooting) |
 | `--allowed-cidr` | — | `*` | `public` mode only: source CIDR allowed to the agent API. Tighten for production |
+| `--domain` | appgw | — | `appgw` mode only: hostname on the cert; point its DNS at the gateway public IP |
+| `--kv-name` | appgw | — | `appgw` mode only: globally-unique Key Vault name (3–24 chars) the stack creates |
+| `--applier-object-id` | appgw | — | `appgw` mode only: objectId of the applying principal (granted Certificates Officer on the vault) |
+| `--cert-pfx` / `--cert-password` | — | — | `appgw` mode only, optional: base64 PFX + password for a trusted cert (else self-signed) |
 | `--ts-authkey` / `--ts-hostname` | tailnet | — | `tailnet` mode only: reusable auth key tagged `tag:formae`, and the tailnet hostname |
 | `--vnet-cidr` / `--subnet-cidr` | — | `10.100.0.0/16` / `10.100.1.0/24` | Address space |
 | `--formae-image` | — | pinned in `vars.pkl` | Agent image; bump to upgrade |
