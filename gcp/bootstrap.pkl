@@ -408,7 +408,10 @@ agent {
       user = "\(vars.dbUser)"
       password = "\(dbPasswordVal)"
       database = "\(vars.dbName)"
-      connectionParams = "sslmode=disable"
+      // No connectionParams over the Cloud SQL unix socket: the agent appends
+      // them as "?sslmode=disable" onto the DB NAME (URL-style DSN) — the VM's
+      // TCP path tolerates it, a socket host does not. Sockets are unencrypted
+      // local, so sslmode is moot.
     }
   }
   synchronization {
@@ -1043,6 +1046,9 @@ local agentService = new service.Service {
             egress = "PRIVATE_RANGES_ONLY"
             networkInterfaces = new Listing {
                 new service.VpcNetworkInterface {
+                    // Reference by resolvable so the service is created AFTER the
+                    // network/subnetwork (create-order edge). The plugin normalizes
+                    // the resolved selfLink to the relative path Cloud Run requires.
                     network = vpcNetwork.res.selfLink
                     subnetwork = subnet.res.selfLink
                 }
