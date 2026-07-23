@@ -25,6 +25,7 @@ import "@gcp/compute/globalForwardingRule.pkl"
 import "@gcp/compute/sslCertificate.pkl"
 import "@gcp/compute/networkEndpointGroup.pkl"
 import "@gcp/cloudrun/service.pkl"
+import "@gcp/cloudrun/serviceIamMember.pkl"
 import "@gcp/servicenetworking/connection.pkl"
 
 import "@gcp/sql/database.pkl"
@@ -628,8 +629,9 @@ forma {
     when (isCloudrun) {
         configSecret
         configSecretVersion
-        agentNeg
         agentService
+        agentInvoker
+        agentNeg
         lbAddress
         bs
         um
@@ -1104,6 +1106,22 @@ local agentService = new service.Service {
             }
         }
     }
+}
+
+// Make the service reachable through the external HTTPS LB: the serverless NEG
+// forwards LB traffic unauthenticated, so Cloud Run needs allUsers/run.invoker or
+// it rejects every request with 403 (the VM/instance-group path never needed this).
+// Network reachability is still locked to the LB by ingress=INTERNAL_LOAD_BALANCER,
+// and the agent's HTTP basic auth is the real gate. NOTE: org policy
+// constraints/iam.allowedPolicyMemberDomains (domain-restricted sharing) forbids
+// allUsers — projects with it need an exception for this binding.
+local agentInvoker = new serviceIamMember.ServiceIamMember {
+    label = "\(n)-invoker"
+    service = agentService.res.name
+    project = projectVal
+    location = regionVal
+    role = "roles/run.invoker"
+    member = "allUsers"
 }
 
 // Regional serverless NEG fronting the Cloud Run service for the LB backend.

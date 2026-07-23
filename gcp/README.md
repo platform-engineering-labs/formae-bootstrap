@@ -205,6 +205,13 @@ Key characteristics:
   xlarge `8000m`/`16Gi`), distinct from the GCE machine-type map.
 - **`--access tailnet`, `--ts-authkey`, `--ts-hostname` are rejected** under
   `--compute cloudrun` (Cloud Run + tailnet is unsupported).
+- **Public IAM binding required.** The serverless NEG forwards LB traffic to Cloud
+  Run unauthenticated, so the service is granted `allUsers` → `roles/run.invoker`
+  (a `GCP::CloudRun::ServiceIamMember`) or it 403s every request. Reachability is
+  still locked to the LB by `ingress=INTERNAL_LOAD_BALANCER`, and the agent's HTTP
+  basic auth is the real gate. **Org-policy caveat:** projects enforcing
+  `constraints/iam.allowedPolicyMemberDomains` (domain-restricted sharing) forbid
+  `allUsers` and need an exception for this binding, or the LB path returns 403.
 
 ## Flags
 
