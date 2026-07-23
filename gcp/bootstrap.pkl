@@ -23,6 +23,9 @@ import "@gcp/compute/urlMap.pkl"
 import "@gcp/compute/targetHttpsProxy.pkl"
 import "@gcp/compute/globalForwardingRule.pkl"
 import "@gcp/compute/sslCertificate.pkl"
+import "@gcp/compute/networkEndpointGroup.pkl"
+import "@gcp/cloudrun/service.pkl"
+import "@gcp/cloudrun/serviceIamMember.pkl"
 import "@gcp/servicenetworking/connection.pkl"
 
 import "@gcp/sql/database.pkl"
@@ -38,7 +41,23 @@ import "./sizing.pkl"
 description {
     text = """
     Formae agent on GCP - the "install formae into a production environment" example.
-    One entrypoint, two secure access modes via --access (there is no plaintext option):
+
+    Two axes: --compute {vm,cloudrun} x --access {tailnet,public} (the one illegal
+    cell, cloudrun+tailnet, is rejected).
+
+      --compute vm        (default) A long-running GCE VM (Container-Optimized OS +
+                          Docker) runs the agent, reached over --access tailnet or
+                          public. Unchanged from before.
+      --compute cloudrun  A serverless Cloud Run service runs the agent (no VM, disk,
+                          or startup script). Single always-on instance (min=max=1,
+                          CPU always allocated). Requires --access public: served at
+                          your custom domain through the external HTTPS LB + a
+                          serverless NEG, with the run.app URL locked to the LB. Reaches
+                          the private Cloud SQL over Direct VPC egress; the whole agent
+                          config is a mounted Secret Manager secret. Cost is roughly the
+                          small VM - the win is ops, not price.
+
+    Access modes (both apply to --compute vm; cloudrun is always public):
 
       public   Public, internet-facing global external HTTPS load balancer terminating
                HTTPS, with HTTP basic auth on top. Certificate via one of: --domain (a
@@ -85,11 +104,18 @@ properties {
         flag = "zone"
         default = vars.zone
     }
+    // Compute substrate: "vm" (long-running GCE VM, the default - unchanged
+    // behavior) or "cloudrun" (serverless Cloud Run service, public LB only).
+    compute = new formae.Prop {
+        flag = "compute"
+        default = "vm"
+    }
     // Access mode: "public" (public HTTPS LB + basic auth) or "tailnet" (private,
-    // Tailscale). Defaults to tailnet to preserve the prior single-mode behavior.
+    // Tailscale). Empty means "derive from --compute": vm -> tailnet (the prior
+    // default), cloudrun -> public (its only supported mode).
     access = new formae.Prop {
         flag = "access"
-        default = "tailnet"
+        default = ""
     }
     // GCE t-shirt size; maps to a machine type (see sizing.pkl).
     size = new formae.Prop {
@@ -167,15 +193,31 @@ properties {
 // ── Mode + validation ─────────────────────────────────────────────────────────
 // AWS-style fail-fast validation: reject cross-mode flags and missing cert inputs
 // with clear messages before any slow cloud round-trip.
+// Compute substrate: vm (default, unchanged) or cloudrun (serverless).
+local compute =
+    let (c = properties.compute.value)
+        if (c != "vm" && c != "cloudrun")
+            throw("--compute must be \"vm\" or \"cloudrun\" (got \"\(c)\")")
+        else c
+local isVm = compute == "vm"
+local isCloudrun = compute == "cloudrun"
+
+// Access mode. Empty --access derives from --compute: vm -> tailnet (the prior
+// default), cloudrun -> public (its only supported mode).
 local access =
-    let (a = properties.access.value)
-        if (a != "public" && a != "tailnet")
-            throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
-        else if (a == "tailnet" && (properties.certName.value != "" || properties.certFile.value != "" || properties.keyFile.value != "" || properties.domain.value != ""))
-            throw("--cert-name, --cert-file, --key-file and --domain apply only to --access public")
-        else if (a == "public" && (properties.tsAuthkey.value != "" || properties.tsHostname.value != ""))
-            throw("--ts-authkey and --ts-hostname apply only to --access tailnet")
-        else a
+    let (raw = properties.access.value)
+        let (a = if (raw != "") raw else if (isCloudrun) "public" else "tailnet")
+            if (a != "public" && a != "tailnet")
+                throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
+            else if (isCloudrun && a != "public")
+                throw("--compute cloudrun supports only --access public (Cloud Run + tailnet is unsupported)")
+            else if (isCloudrun && (properties.tsAuthkey.value != "" || properties.tsHostname.value != ""))
+                throw("--ts-authkey and --ts-hostname apply only to --compute vm --access tailnet")
+            else if (a == "tailnet" && (properties.certName.value != "" || properties.certFile.value != "" || properties.keyFile.value != "" || properties.domain.value != ""))
+                throw("--cert-name, --cert-file, --key-file and --domain apply only to --access public")
+            else if (a == "public" && (properties.tsAuthkey.value != "" || properties.tsHostname.value != ""))
+                throw("--ts-authkey and --ts-hostname apply only to --access tailnet")
+            else a
 
 local isPublic = access == "public"
 local isTailnet = access == "tailnet"
@@ -239,6 +281,8 @@ local n = properties.name.value
 local regionVal = properties.region.value
 local zoneVal = properties.zone.value
 local machineTypeVal = sizing.forSize(properties.size.value)
+// Cloud Run cpu/memory limits for the chosen size (used only under --compute cloudrun).
+local cloudrunLimits = sizing.forSizeCloudrun(properties.size.value)
 local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
 // Cloud SQL connection name is deterministic: project:region:instance.
 local dbInstanceName = "\(n)-db"
@@ -334,6 +378,67 @@ network = new NetworkConfig {
 """
 
 local agentConfig = if (isPublic) publicAgentConfig else tailnetAgentConfig
+
+// ── Cloud Run agent config (rendered secret) ──────────────────────────────────
+// Cloud Run has no shell step to expand $FORMAE_*, so the whole config is rendered
+// here with the secret values interpolated by Pkl, stored as a Secret Manager
+// secret, mounted as a volume, and passed via --config. The datastore is reached
+// over the Cloud SQL connector unix socket (/cloudsql/<connName>) rather than a
+// local proxy on 127.0.0.1:5432. No tailscale network block (public LB only).
+local cloudrunAgentConfig = """
+amends "formae:/Config.pkl"
+import "plugins:/Gcp.pkl" as Gcp
+import "plugins:/AuthBasic.pkl" as AuthBasic
+agent {
+  auth = new AuthBasic.AgentConfig {
+    authorizedUsers {
+      new AuthBasic.AuthorizedUser {
+        username = "\(properties.apiUser.value)"
+        password = "\(apiPasswordHashVal)"
+      }
+    }
+  }
+  server {
+    port = \(vars.formaePort)
+  }
+  datastore {
+    datastoreType = "postgres"
+    postgres {
+      host = "/cloudsql/\(dbConnName)"
+      port = 5432
+      user = "\(vars.dbUser)"
+      password = "\(dbPasswordVal)"
+      database = "\(vars.dbName)"
+      // No connectionParams over the Cloud SQL unix socket: the agent appends
+      // them as "?sslmode=disable" onto the DB NAME (URL-style DSN) — the VM's
+      // TCP path tolerates it, a socket host does not. Sockets are unencrypted
+      // local, so sslmode is moot.
+    }
+  }
+  synchronization {
+    enabled = true
+    interval = 300.s
+  }
+  discovery {
+    enabled = true
+    interval = 600.s
+  }
+  resourcePlugins {
+    new Gcp.PluginConfig {
+      discoveryFilters = new Listing {
+        new MatchFilter {
+          conditions = new Listing {
+            new FilterCondition {
+              propertyPath = "$.labels.app"
+              propertyValue = "formae-agent"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
 // ── VM startup scripts (Container-Optimized OS) ───────────────────────────────
 // Both fetch secrets via the metadata access token (no gcloud on COS), start the
@@ -488,21 +593,23 @@ forma {
     apiSecret
     apiSecretVersion
 
-    // compute (shared)
-    bootDisk
-    agentVm
+    // compute: the GCE VM (boot disk + instance) only under --compute vm.
+    when (isVm) {
+        bootDisk
+        agentVm
+    }
 
-    // tailnet: persistent tsnet identity disk + Tailscale auth key secret
-    when (isTailnet) {
+    // tailnet (vm only): persistent tsnet identity disk + Tailscale auth key secret
+    when (isVm && isTailnet) {
         tsnetDisk
         tsSecret
         tsSecretVersion
     }
 
-    // public: global external HTTPS load balancer in front of the VM, in
+    // vm public: global external HTTPS load balancer in front of the VM, in
     // dependency order (address + health check + firewall, then the backend
     // chain: instance group -> backend service -> url map -> proxy -> rule).
-    when (isPublic) {
+    when (isVm && isPublic) {
         lbAddress
         hc
         gfeFirewall
@@ -512,8 +619,29 @@ forma {
         proxy
         fr
     }
-    // Only the --cert-file path creates an in-stack SELF_MANAGED certificate;
-    // --cert-name references a pre-created one by name on the proxy.
+
+    // cloudrun: a serverless Cloud Run service reached over the SAME external
+    // HTTPS LB via a serverless NEG backend (no VM, no instance group, no health
+    // check, no guest firewall - serverless backends are not health-checked and
+    // Cloud Run is not in the VPC data path). The whole agent config is a mounted
+    // Secret Manager secret. bs/um/proxy/fr/lbAddress are shared with the vm-public
+    // block (bs is defined per-compute); only one compute branch is ever active.
+    when (isCloudrun) {
+        configSecret
+        configSecretVersion
+        agentService
+        agentInvoker
+        agentNeg
+        lbAddress
+        bs
+        um
+        proxy
+        fr
+    }
+
+    // In-stack certificate (SELF_MANAGED from --cert-file, or MANAGED from
+    // --domain), shared by vm-public and cloudrun; --cert-name references a
+    // pre-created cert by name on the proxy instead.
     when (isPublic && useCertResource) {
         sslCert
     }
@@ -832,19 +960,35 @@ local ig = new instanceGroup.InstanceGroup {
     instances = new Listing { agentVm.res.selfLink }
 }
 
-local bs = new backendService.BackendService {
-    label = "\(n)-bs"
-    name = "\(n)-bs"
-    protocol = "HTTP"
-    portName = "formae"
-    loadBalancingScheme = "EXTERNAL_MANAGED"
-    healthChecks = new Listing { hc.res.selfLink }
-    backends = new Listing {
-        new backendService.Backend {
-            group = ig.res.selfLink
+// Backend service. vm: instance-group backend, health-checked on the formae port.
+// cloudrun: serverless NEG backend - no health check, no named port, no instance
+// group (serverless backends are not health-checked).
+local bs =
+    if (isCloudrun)
+        new backendService.BackendService {
+            label = "\(n)-bs"
+            name = "\(n)-bs"
+            loadBalancingScheme = "EXTERNAL_MANAGED"
+            backends = new Listing {
+                new backendService.Backend {
+                    group = agentNeg.res.selfLink
+                }
+            }
         }
-    }
-}
+    else
+        new backendService.BackendService {
+            label = "\(n)-bs"
+            name = "\(n)-bs"
+            protocol = "HTTP"
+            portName = "formae"
+            loadBalancingScheme = "EXTERNAL_MANAGED"
+            healthChecks = new Listing { hc.res.selfLink }
+            backends = new Listing {
+                new backendService.Backend {
+                    group = ig.res.selfLink
+                }
+            }
+        }
 
 local um = new urlMap.UrlMap {
     label = "\(n)-um"
@@ -867,4 +1011,126 @@ local fr = new globalForwardingRule.GlobalForwardingRule {
     targetProxy = proxy.res.selfLink
     // Must match the backend service scheme end-to-end.
     loadBalancingScheme = "EXTERNAL_MANAGED"
+}
+
+// ── Cloud Run (--compute cloudrun) ────────────────────────────────────────────
+// The whole agent config, rendered with secret values interpolated by Pkl, stored
+// as a Secret Manager secret and mounted into the service (no shell heredoc).
+local configSecret = new secret.Secret {
+    label = "\(n)-config-secret"
+    name = "\(n)-agent-config"
+    labels = commonLabels
+}
+local configSecretVersion = new secretVersion.SecretVersion {
+    label = "\(n)-config-secret-version"
+    secret = configSecret.res.name
+    data = cloudrunAgentConfig
+}
+
+// The Cloud Run service running the agent. Single always-on instance (min=max=1,
+// cpuIdle=false: the agent runs background sync/discovery off-request). Reaches the
+// private Cloud SQL over Direct VPC egress (PRIVATE_RANGES_ONLY) + the built-in
+// Cloud SQL connector volume; the run.app URL is locked to the load balancer.
+local agentService = new service.Service {
+    label = "\(n)-agent-service"
+    project = projectVal
+    region = regionVal
+    name = "\(n)-agent"
+    labels = commonLabels
+    ingress = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+    template = new service.RevisionTemplate {
+        serviceAccount = saEmail
+        scaling = new service.RevisionScaling {
+            minInstanceCount = 1
+            maxInstanceCount = 1
+        }
+        vpcAccess = new service.VpcAccess {
+            egress = "PRIVATE_RANGES_ONLY"
+            networkInterfaces = new Listing {
+                new service.VpcNetworkInterface {
+                    // Reference by resolvable so the service is created AFTER the
+                    // network/subnetwork (create-order edge). The plugin normalizes
+                    // the resolved selfLink to the relative path Cloud Run requires.
+                    network = vpcNetwork.res.selfLink
+                    subnetwork = subnet.res.selfLink
+                }
+            }
+        }
+        containers = new Listing {
+            new service.Container {
+                image = properties.formaeImage.value
+                ports = new Listing {
+                    new service.ContainerPort { containerPort = vars.formaePort }
+                }
+                resources = new service.ResourceRequirements {
+                    limits = new Mapping {
+                        ["cpu"] = cloudrunLimits.cpu
+                        ["memory"] = cloudrunLimits.memory
+                    }
+                    cpuIdle = false
+                }
+                volumeMounts = new Listing {
+                    new service.VolumeMount {
+                        name = "config"
+                        mountPath = "/home/pel/.config/formae"
+                    }
+                    new service.VolumeMount {
+                        name = "cloudsql"
+                        mountPath = "/cloudsql"
+                    }
+                }
+                // Mirror the VM's `docker run IMAGE formae agent start --config ...`
+                // (CMD override; the image entrypoint is empty).
+                args = new Listing { "formae"; "agent"; "start"; "--config"; "/home/pel/.config/formae/formae.conf.pkl" }
+            }
+        }
+        volumes = new Listing {
+            new service.Volume {
+                name = "config"
+                secret = new service.SecretVolumeSource {
+                    secret = configSecret.res.name
+                    items = new Listing {
+                        new service.SecretVolumeItem {
+                            key = "formae.conf.pkl"
+                            version = "latest"
+                            path = "formae.conf.pkl"
+                        }
+                    }
+                }
+            }
+            new service.Volume {
+                name = "cloudsql"
+                cloudSqlInstance = new service.CloudSqlInstance {
+                    instances = new Listing { dbConnName }
+                }
+            }
+        }
+    }
+}
+
+// Make the service reachable through the external HTTPS LB: the serverless NEG
+// forwards LB traffic unauthenticated, so Cloud Run needs allUsers/run.invoker or
+// it rejects every request with 403 (the VM/instance-group path never needed this).
+// Network reachability is still locked to the LB by ingress=INTERNAL_LOAD_BALANCER,
+// and the agent's HTTP basic auth is the real gate. NOTE: org policy
+// constraints/iam.allowedPolicyMemberDomains (domain-restricted sharing) forbids
+// allUsers — projects with it need an exception for this binding.
+local agentInvoker = new serviceIamMember.ServiceIamMember {
+    label = "\(n)-invoker"
+    service = agentService.res.name
+    project = projectVal
+    location = regionVal
+    role = "roles/run.invoker"
+    member = "allUsers"
+}
+
+// Regional serverless NEG fronting the Cloud Run service for the LB backend.
+local agentNeg = new networkEndpointGroup.NetworkEndpointGroup {
+    label = "\(n)-neg"
+    name = "\(n)-neg"
+    region = regionVal
+    networkEndpointType = "SERVERLESS"
+    cloudRun = new networkEndpointGroup.CloudRun {
+        service = agentService.res.name
+    }
 }

@@ -12,6 +12,11 @@ access modes via `--access` (there is no plaintext option):
 - **`tailnet`** (default) — private, reached only over your Tailscale tailnet (no public
   ingress), serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
 
+Orthogonal to `--access` is **`--compute`**: `vm` (default — the GCE VM above) or
+`cloudrun` (a serverless Cloud Run service, no VM). `--compute cloudrun` is always
+public and reuses the same external HTTPS LB — see
+[Cloud Run compute mode](#cloud-run-compute-mode---compute-cloudrun).
+
 > **Version dependency.** `--access public` requires a GCP plugin that implements
 > `GCP::Compute::InstanceGroup` VM membership (the `instances` field) and the widened
 > `SslCertificate.privateKey`. Until those land in a published release, `gcp/PklProject`
@@ -157,12 +162,64 @@ curl -k --resolve formae.example.com:443:$IP https://formae.example.com/api/v1/h
 > (`https://www.googleapis.com/compute/v1/projects/.../global/sslCertificates/NAME`), not a
 > bare name — the target HTTPS proxy resolves the resource URL, not a short name.
 
+## Cloud Run compute mode (`--compute cloudrun`)
+
+`--compute cloudrun` runs the agent as a **serverless Cloud Run service** instead of a GCE
+VM — no OS, disk, or startup script to manage. It is always **public**: served at your
+custom domain through the **same external HTTPS LB** as `--access public`, via a
+**serverless NEG** backend, with the `run.app` URL locked to the load balancer
+(`ingress = INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`) and HTTP basic auth on top. It reuses
+the same private Cloud SQL substrate.
+
+```bash
+formae apply --mode reconcile gcp/bootstrap.pkl --compute cloudrun \
+  --project <project> \
+  --domain formae.example.com \
+  --api-user formae --api-password-hash '<hash>' \
+  --db-password '<db-password>' \
+  --watch
+```
+
+Certificate options are identical to `--access public`: `--domain` (Google-managed),
+`--cert-name`, or `--cert-file`+`--key-file`. Point the domain's DNS **A record at the
+reserved global address the stack prints**, then verify exactly as in the public
+Quickstart (`/api/v1/health` → 200; agent API → 401 without `-u`, 200 with).
+
+Key characteristics:
+
+- **Single always-on instance.** `minInstanceCount = maxInstanceCount = 1` and
+  `cpuIdle = false`. The agent is a single-actor daemon running background sync (300s) and
+  discovery (600s) off-request — two instances collide on one datastore, and scale-to-zero
+  would stop the background loops. **This is not a scalable deployment and won't become
+  one.** Cost is roughly the small VM; the win is ops, not price.
+- **Private Cloud SQL over Direct VPC egress.** The service attaches to the bootstrap
+  subnet with `vpcAccess.egress = PRIVATE_RANGES_ONLY` (only RFC1918 goes over the VPC, so
+  Cloud Run needs no NAT of its own) and reaches the private-IP instance through the
+  built-in Cloud SQL connector volume; the agent connects over the
+  `/cloudsql/<connName>` unix socket (`sslmode=disable`).
+- **Config as a mounted secret.** Cloud Run has no shell step to expand `$FORMAE_*`, so the
+  whole agent config is rendered by Pkl (secret values inlined), stored as a Secret Manager
+  secret, mounted as a volume, and passed with `--config`. No config plaintext in the
+  service spec.
+- **Sizing.** `--size` maps to a Cloud-Run-legal cpu/memory pair (small `1000m`/`2Gi` …
+  xlarge `8000m`/`16Gi`), distinct from the GCE machine-type map.
+- **`--access tailnet`, `--ts-authkey`, `--ts-hostname` are rejected** under
+  `--compute cloudrun` (Cloud Run + tailnet is unsupported).
+- **Public IAM binding required.** The serverless NEG forwards LB traffic to Cloud
+  Run unauthenticated, so the service is granted `allUsers` → `roles/run.invoker`
+  (a `GCP::CloudRun::ServiceIamMember`) or it 403s every request. Reachability is
+  still locked to the LB by `ingress=INTERNAL_LOAD_BALANCER`, and the agent's HTTP
+  basic auth is the real gate. **Org-policy caveat:** projects enforcing
+  `constraints/iam.allowedPolicyMemberDomains` (domain-restricted sharing) forbid
+  `allUsers` and need an exception for this binding, or the LB path returns 403.
+
 ## Flags
 
 | Flag | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `--project` | yes | — | GCP project ID |
-| `--access` | no | `tailnet` | `public` (HTTPS LB) or `tailnet` (Tailscale) |
+| `--compute` | no | `vm` | `vm` (GCE VM) or `cloudrun` (serverless Cloud Run, always public) |
+| `--access` | no | `tailnet` (vm) / `public` (cloudrun) | `public` (HTTPS LB) or `tailnet` (Tailscale); empty derives from `--compute` |
 | `--api-password-hash` | yes (both modes) | — | bcrypt hash from `gen-api-credential.sh` |
 | `--db-password` | yes (both modes) | — | stable Cloud SQL postgres password |
 | `--domain` | public: one of these three | — | Google-managed cert for this hostname (auto-provisioned + renewed); also the DNS name to point at the LB |
@@ -172,12 +229,13 @@ curl -k --resolve formae.example.com:443:$IP https://formae.example.com/api/v1/h
 | `--ts-hostname` | no (tailnet) | `--name` | tailnet MagicDNS hostname |
 | `--name` | no | `formae-bootstrap` | resource name prefix |
 | `--region` / `--zone` | no | `us-central1` / `us-central1-a` | location |
-| `--size` | no | `small` | agent VM size (small/medium/large/xlarge → GCE machine type) |
+| `--size` | no | `small` | agent size (small/medium/large/xlarge → GCE machine type, or a Cloud Run cpu/memory pair under `--compute cloudrun`) |
 | `--formae-image` | no | pinned | agent image (version knob) |
 | `--subnet-cidr` | no | `10.100.1.0/24` | private subnet range |
 
-Cross-mode flags are rejected fast: `--cert-*`/`--domain` throw under `tailnet`, and
-`--ts-authkey`/`--ts-hostname` throw under `public`, with a clear message.
+Cross-mode flags are rejected fast: `--cert-*`/`--domain` throw under `tailnet`,
+`--ts-authkey`/`--ts-hostname` throw under `public` (and under `--compute cloudrun`), and
+`--compute cloudrun` with `--access tailnet` throws — each with a clear message.
 
 ### Public mode notes
 
@@ -228,6 +286,13 @@ formae apply --mode destroy gcp/destroy-target.pkl
 (VM membership), `SslCertificate.privateKey` opaque-wrapping, and SELF_MANAGED
 `selfManaged` nesting (for `--cert-file`). The `tailnet` mode has no such dependency.
 
+**`--compute cloudrun` needs a newer GCP plugin** than 0.1.9: it uses
+`GCP::CloudRun::Service.template.vpcAccess` (Direct VPC egress), secret-volume `items`
+(config mount), and a `Resolvable` `SecretVolumeSource.secret` — all added in
+[formae-plugin-gcp#87](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/87).
+Bump the `gcp@…` pin above to the release that includes #87 before using
+`--compute cloudrun`.
+
 ## Validation status
 
 **`--access public` is validated live, end to end (2026-07-20).** Deployed to a real
@@ -253,6 +318,16 @@ Teardown note).
 
 `pkl eval` / `formae apply --simulate` are clean for `tailnet` (default, unchanged) and
 all three public certificate paths.
+
+**`--compute cloudrun` is render-validated, live pending.** Against the plugin schema with
+[#87](https://github.com/platform-engineering-labs/formae-plugin-gcp/pull/87), the render
+matrix passes: all four `vm` cells are byte-identical to pre-change (zero regression); the
+three `cloudrun` cert cells render the expected set (Cloud Run service with min=max=1,
+`cpuIdle=false`, `ingress=INTERNAL_LOAD_BALANCER`, Direct VPC egress, Cloud SQL connector
+volume, config-secret volume; serverless NEG; reused LB chain; no VM/instance-group/health
+-check/guest-firewall); and the illegal combinations throw. The **live** end-to-end run
+(real project + domain + cert) is the remaining gate, and depends on the plugin release
+that carries #87.
 
 The earlier tailnet-mode blockers (private-IP Cloud SQL, re-apply drift) are resolved on
 plugin `main` (Private Service Access support + read-back normalization landed).
