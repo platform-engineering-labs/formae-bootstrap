@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: FSL-1.1-ALv2
  */
 
-amends "@formae/forma.pkl"
+extends "@formae/forma.pkl"
 import "@formae/formae.pkl"
 import "@azure/azure.pkl"
 
@@ -74,134 +74,107 @@ description {
     confirm = true
 }
 
-properties {
-    name = new formae.Prop {
-        flag = "name"
-        default = vars.projectName
-    }
-    location = new formae.Prop {
-        flag = "location"
-        default = vars.location
-    }
-    // Azure subscription the agent's infrastructure lives in. Required.
-    subscriptionId = new formae.Prop {
-        flag = "subscription-id"
-        default = vars.subscriptionId
-    }
-    // Entra tenant of the subscription. Required (service-principal login).
-    tenantId = new formae.Prop {
-        flag = "tenant-id"
-        default = ""
-    }
-    // Service principal the agent operates Azure with (az ad sp create-for-rbac
-    // --role Contributor --scopes /subscriptions/<sub>). Required.
-    clientId = new formae.Prop {
-        flag = "client-id"
-        default = ""
-    }
-    clientSecret = new formae.Prop {
-        flag = "client-secret"
-        default = ""
-    }
-    // VM t-shirt size; maps to an Azure VM size (see sizing.pkl).
-    size = new formae.Prop {
-        flag = "size"
-        default = "small"
-    }
-    // `public` (self-signed), `appgw` (App Gateway + Key Vault cert), or
-    // `tailnet` (private, Tailscale).
-    access = new formae.Prop {
-        flag = "access"
-        default = "public"
-    }
-    // Full agent image reference. Upgrade the agent by re-applying with a newer tag.
-    formaeImage = new formae.Prop {
-        flag = "formae-image"
-        default = vars.formaeImage
-    }
-    // Basic-auth username for the agent API.
-    apiUser = new formae.Prop {
-        flag = "api-user"
-        default = "formae"
-    }
-    // Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
-    // azure/scripts/gen-api-credential.sh.
-    apiPasswordHash = new formae.Prop {
-        flag = "api-password-hash"
-        default = ""
-    }
-    // Postgres admin password. Supplied (not generated in-forma) so the value is
-    // stable across applies; gen-api-credential.sh prints one.
-    dbPassword = new formae.Prop {
-        flag = "db-password"
-        default = ""
-    }
-    // SSH public key for the VM admin user (Azure requires one even if you never
-    // log in). ssh-keygen -t ed25519 works.
-    sshPublicKey = new formae.Prop {
-        flag = "ssh-public-key"
-        default = ""
-    }
-    // public mode only: CIDR allowed to reach the agent API. Default: everywhere
-    // (basic auth + TLS still apply). Tighten for production.
-    allowedCidr = new formae.Prop {
-        flag = "allowed-cidr"
-        default = "*"
-    }
-    // appgw mode only: the hostname clients connect to (must match the cert's
-    // subject/SAN). Point its DNS at the Application Gateway's public IP.
-    domain = new formae.Prop {
-        flag = "domain"
-        default = ""
-    }
-    // appgw mode only: globally-unique Key Vault name (3-24 chars, alphanumeric +
-    // hyphen, starts with a letter). The stack creates this vault to hold the cert.
-    kvName = new formae.Prop {
-        flag = "kv-name"
-        default = ""
-    }
-    // appgw mode only: objectId (principal object ID, NOT the appId) of the
-    // principal running this apply — granted "Key Vault Certificates Officer" on
-    // the new vault so the plugin can create the certificate (data-plane). Find it
-    // with: az ad sp show --id <client-id> --query id -o tsv
-    applierObjectId = new formae.Prop {
-        flag = "applier-object-id"
-        default = ""
-    }
-    // appgw mode, optional: base64-encoded PFX to import as the gateway cert. When
-    // omitted, the stack issues a self-signed cert (works, but not browser-trusted).
-    certPfx = new formae.Prop {
-        flag = "cert-pfx"
-        default = ""
-    }
-    // appgw mode, optional: password for --cert-pfx.
-    certPassword = new formae.Prop {
-        flag = "cert-password"
-        default = ""
-    }
-    // tailnet mode only: a reusable Tailscale auth key (tagged tag:formae).
-    tsAuthkey = new formae.Prop {
-        flag = "ts-authkey"
-        default = ""
-    }
-    // tailnet mode only: the tailnet (MagicDNS) hostname. Defaults to --name.
-    tsHostname = new formae.Prop {
-        flag = "ts-hostname"
-        default = ""
-    }
-    vnetCidr = new formae.Prop {
-        flag = "vnet-cidr"
-        default = vars.vnetCidr
-    }
-    subnetCidr = new formae.Prop {
-        flag = "subnet-cidr"
-        default = vars.subnetCidr
-    }
+properties: Props
+
+class Props {
+    name: String = vars.projectName
+
+    location: String = vars.location
+
+    /// Azure subscription the agent's infrastructure lives in. Required.
+    @formae.Flag { name = "subscription-id" }
+    subscriptionId: String = vars.subscriptionId
+
+    /// Entra tenant of the subscription. Required (service-principal login).
+    @formae.Flag { name = "tenant-id" }
+    tenantId: String = ""
+
+    /// Service principal the agent operates Azure with (az ad sp create-for-rbac
+    /// --role Contributor --scopes /subscriptions/<sub>). Required.
+    @formae.Flag { name = "client-id" }
+    clientId: String = ""
+
+    @formae.Flag { name = "client-secret" }
+    clientSecret: String = ""
+
+    /// VM t-shirt size; maps to an Azure VM size (see sizing.pkl).
+    size: String = "small"
+
+    /// `public` (self-signed), `appgw` (App Gateway + Key Vault cert), or
+    /// `tailnet` (private, Tailscale).
+    access: String = "public"
+
+    /// Full agent image reference. Upgrade the agent by re-applying with a newer tag.
+    @formae.Flag { name = "formae-image" }
+    formaeImage: String = vars.formaeImage
+
+    /// Basic-auth username for the agent API.
+    @formae.Flag { name = "api-user" }
+    apiUser: String = "formae"
+
+    /// Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
+    /// azure/scripts/gen-api-credential.sh.
+    @formae.Flag { name = "api-password-hash" }
+    apiPasswordHash: String = ""
+
+    /// Postgres admin password. Supplied (not generated in-forma) so the value is
+    /// stable across applies; gen-api-credential.sh prints one.
+    @formae.Flag { name = "db-password" }
+    dbPassword: String = ""
+
+    /// SSH public key for the VM admin user (Azure requires one even if you never
+    /// log in). ssh-keygen -t ed25519 works.
+    @formae.Flag { name = "ssh-public-key" }
+    sshPublicKey: String = ""
+
+    /// public mode only: CIDR allowed to reach the agent API. Default: everywhere
+    /// (basic auth + TLS still apply). Tighten for production.
+    @formae.Flag { name = "allowed-cidr" }
+    allowedCidr: String = "*"
+
+    /// appgw mode only: the hostname clients connect to (must match the cert's
+    /// subject/SAN). Point its DNS at the Application Gateway's public IP.
+    domain: String = ""
+
+    /// appgw mode only: globally-unique Key Vault name (3-24 chars, alphanumeric +
+    /// hyphen, starts with a letter). The stack creates this vault to hold the cert.
+    @formae.Flag { name = "kv-name" }
+    kvName: String = ""
+
+    /// appgw mode only: objectId (principal object ID, NOT the appId) of the
+    /// principal running this apply — granted "Key Vault Certificates Officer" on
+    /// the new vault so the plugin can create the certificate (data-plane). Find it
+    /// with: az ad sp show --id <client-id> --query id -o tsv
+    @formae.Flag { name = "applier-object-id" }
+    applierObjectId: String = ""
+
+    /// appgw mode, optional: base64-encoded PFX to import as the gateway cert. When
+    /// omitted, the stack issues a self-signed cert (works, but not browser-trusted).
+    @formae.Flag { name = "cert-pfx" }
+    certPfx: String = ""
+
+    /// appgw mode, optional: password for --cert-pfx.
+    @formae.Flag { name = "cert-password" }
+    certPassword: String = ""
+
+    /// tailnet mode only: a reusable Tailscale auth key (tagged tag:formae).
+    @formae.Flag { name = "ts-authkey" }
+    tsAuthkey: String = ""
+
+    /// tailnet mode only: the tailnet (MagicDNS) hostname. Defaults to --name.
+    @formae.Flag { name = "ts-hostname" }
+    tsHostname: String = ""
+
+    @formae.Flag { name = "vnet-cidr" }
+    vnetCidr: String = vars.vnetCidr
+
+    @formae.Flag { name = "subnet-cidr" }
+    subnetCidr: String = vars.subnetCidr
 }
 
 // ── Required inputs ───────────────────────────────────────────────────────────
 local access =
-    let (a = properties.access.value)
+    let (a = properties.access)
     if (a != "public" && a != "appgw" && a != "tailnet")
         throw("--access must be \"public\", \"appgw\" or \"tailnet\" (got \"\(a)\")")
     else a
@@ -211,46 +184,46 @@ local isTailnet = access == "tailnet"
 
 // appgw-mode required inputs (referenced only inside the appgw branch).
 local domainVal =
-    if (isAppgw && properties.domain.value == "") throw("--domain is required for --access appgw (the hostname clients connect to; point its DNS at the gateway public IP)")
-    else properties.domain.value
+    if (isAppgw && properties.domain == "") throw("--domain is required for --access appgw (the hostname clients connect to; point its DNS at the gateway public IP)")
+    else properties.domain
 local kvNameVal =
-    if (isAppgw && properties.kvName.value == "") throw("--kv-name is required for --access appgw (a globally-unique Key Vault name, 3-24 chars)")
-    else properties.kvName.value
+    if (isAppgw && properties.kvName == "") throw("--kv-name is required for --access appgw (a globally-unique Key Vault name, 3-24 chars)")
+    else properties.kvName
 local applierObjectIdVal =
-    if (isAppgw && properties.applierObjectId.value == "") throw("--applier-object-id is required for --access appgw (objectId of the applying principal; az ad sp show --id <client-id> --query id -o tsv)")
-    else properties.applierObjectId.value
-local certPfxVal = properties.certPfx.value
-local certPasswordVal = properties.certPassword.value
+    if (isAppgw && properties.applierObjectId == "") throw("--applier-object-id is required for --access appgw (objectId of the applying principal; az ad sp show --id <client-id> --query id -o tsv)")
+    else properties.applierObjectId
+local certPfxVal = properties.certPfx
+local certPasswordVal = properties.certPassword
 
 local subscriptionIdVal =
-    if (properties.subscriptionId.value == "") throw("--subscription-id is required (the Azure subscription ID)")
-    else properties.subscriptionId.value
+    if (properties.subscriptionId == "") throw("--subscription-id is required (the Azure subscription ID)")
+    else properties.subscriptionId
 local tenantIdVal =
-    if (properties.tenantId.value == "") throw("--tenant-id is required (the Entra tenant ID)")
-    else properties.tenantId.value
+    if (properties.tenantId == "") throw("--tenant-id is required (the Entra tenant ID)")
+    else properties.tenantId
 local clientIdVal =
-    if (properties.clientId.value == "") throw("--client-id is required (service principal appId; az ad sp create-for-rbac)")
-    else properties.clientId.value
+    if (properties.clientId == "") throw("--client-id is required (service principal appId; az ad sp create-for-rbac)")
+    else properties.clientId
 local clientSecretVal =
-    if (properties.clientSecret.value == "") throw("--client-secret is required (service principal password)")
-    else properties.clientSecret.value
+    if (properties.clientSecret == "") throw("--client-secret is required (service principal password)")
+    else properties.clientSecret
 local apiPasswordHashVal =
-    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required. Generate it with azure/scripts/gen-api-credential.sh")
-    else properties.apiPasswordHash.value
+    if (properties.apiPasswordHash == "") throw("--api-password-hash is required. Generate it with azure/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash
 local dbPasswordVal =
-    if (properties.dbPassword.value == "") throw("--db-password is required (a stable Postgres admin password; gen-api-credential.sh prints one)")
-    else properties.dbPassword.value
+    if (properties.dbPassword == "") throw("--db-password is required (a stable Postgres admin password; gen-api-credential.sh prints one)")
+    else properties.dbPassword
 local sshPublicKeyVal =
-    if (properties.sshPublicKey.value == "") throw("--ssh-public-key is required (contents of e.g. ~/.ssh/id_ed25519.pub)")
-    else properties.sshPublicKey.value
+    if (properties.sshPublicKey == "") throw("--ssh-public-key is required (contents of e.g. ~/.ssh/id_ed25519.pub)")
+    else properties.sshPublicKey
 local tsAuthkeyVal =
-    if (isTailnet && properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
-    else properties.tsAuthkey.value
+    if (isTailnet && properties.tsAuthkey == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
+    else properties.tsAuthkey
 
-local n = properties.name.value
-local loc = properties.location.value
-local vmSizeVal = sizing.forSize(properties.size.value)
-local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+local n = properties.name
+local loc = properties.location
+local vmSizeVal = sizing.forSize(properties.size)
+local tsHostnameVal = if (properties.tsHostname == "") n else properties.tsHostname
 local dbServerName = "\(n)-db"
 // Flexible Server FQDNs are deterministic; inside the VNet the privatelink DNS
 // zone resolves this to the private endpoint's IP.
@@ -298,7 +271,7 @@ agent {
   auth = new AuthBasic.AgentConfig {
     authorizedUsers {
       new AuthBasic.AuthorizedUser {
-        username = "\(properties.apiUser.value)"
+        username = "\(properties.apiUser)"
         password = "\(apiPasswordHashVal)"
       }
     }
@@ -409,7 +382,7 @@ cat > /var/formae/formae.conf.pkl << 'PKLEOF'
 \(agentConfig)
 PKLEOF
 
-FORMAE_IMAGE="\(properties.formaeImage.value)"
+FORMAE_IMAGE="\(properties.formaeImage)"
 retry docker pull "$FORMAE_IMAGE"
 docker rm -f formae-agent >/dev/null 2>&1 || true
 docker run -d --restart always --name formae-agent --network host \\
@@ -483,7 +456,7 @@ local vnet = new virtualnetwork.VirtualNetwork {
     location = loc
     resourceGroupName = rg.res.name
     addressSpace = new virtualnetwork.AddressSpace {
-        addressPrefixes { properties.vnetCidr.value }
+        addressPrefixes { properties.vnetCidr }
     }
     tags = commonTags
 }
@@ -493,7 +466,7 @@ local snet = new subnet.Subnet {
     name = "\(n)-subnet"
     resourceGroupName = rg.res.name
     virtualNetworkName = vnet.res.name
-    addressPrefix = properties.subnetCidr.value
+    addressPrefix = properties.subnetCidr
 }
 
 local nsg = new networksecuritygroup.NetworkSecurityGroup {
@@ -512,7 +485,7 @@ local nsg = new networksecuritygroup.NetworkSecurityGroup {
                 direction = "Inbound"
                 access = "Allow"
                 protocol = "Tcp"
-                sourceAddressPrefix = properties.allowedCidr.value
+                sourceAddressPrefix = properties.allowedCidr
                 sourcePortRange = "*"
                 destinationAddressPrefix = "*"
                 destinationPortRange = "\(vars.formaePort)"
