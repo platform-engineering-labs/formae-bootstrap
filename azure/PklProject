@@ -6,9 +6,9 @@ dependencies {
   }
 
   // appgw mode needs App Gateway KV-cert wiring + KeyVault::Certificate + identity
-  // + role assignment, first released in the azure plugin 0.1.10. public/tailnet
-  // work with any 0.1.x. Bump to the exact published version at release time.
+  // + role assignment, released in the azure plugin 0.1.8. public/tailnet work
+  // with any 0.1.x.
   ["azure"] {
-    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.10"
+    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.8"
   }
 }

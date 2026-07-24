@@ -37,3 +37,19 @@ One command, two **secure** access modes — there is no plaintext option:
   serving a trusted `*.ts.net` certificate, with basic auth on top.
 
 Full instructions in [`azure/README.md`](azure/README.md).
+
+## GCP
+
+[`gcp/`](gcp/) installs a production formae agent on a GCE VM, backed by Cloud SQL
+PostgreSQL. One **secure** access mode today:
+
+- **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
+  serving a trusted `*.ts.net` certificate, with basic auth on top.
+
+Cloud SQL is reached through the Cloud SQL Auth Proxy (via the VM service account) and
+secrets live in Secret Manager. A public HTTPS mode (AWS `alb` equivalent) is not offered
+yet — a GCE-VM-backed load balancer needs instance-group membership the plugin doesn't
+implement. Until the GCP plugin is published, `gcp/PklProject` uses a local path
+dependency on the plugin schema.
+
+Full instructions in [`gcp/README.md`](gcp/README.md).

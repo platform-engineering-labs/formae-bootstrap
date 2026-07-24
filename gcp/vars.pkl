@@ -1,0 +1,38 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+import "@formae/formae.pkl"
+
+projectName = "formae-bootstrap"
+// GCP project the agent's infrastructure lives in. Required (no sane default).
+project = ""
+region = "us-central1"
+zone = "us-central1-a"
+// Private subnet the agent VM + Cloud SQL proxy egress live in.
+subnetCidr = "10.100.1.0/24"
+
+// Cloud SQL Postgres.
+dbTier = "db-custom-1-3840" // 1 vCPU / 3.75 GB
+dbVersion = "POSTGRES_16"
+dbName = "formae"
+// Cloud SQL's built-in superuser. The agent connects as this via the Auth Proxy.
+dbUser = "postgres"
+
+// Container-Optimized OS image family for the agent VM (has Docker; runs the
+// agent + Cloud SQL Auth Proxy containers via the startup script).
+bootImage = "projects/cos-cloud/global/images/family/cos-stable"
+bootDiskSizeGb = 20
+// Persistent disk that survives VM replacement, holding the tsnet machine
+// identity (the GCP analog of the AWS tailnet EFS volume).
+tsnetDiskSizeGb = 10
+
+formaeImage = "ghcr.io/platform-engineering-labs/formae:0.87.0"
+formaePort = 49684
+
+stack: formae.Stack = new {
+    label = "formae-gcp-bootstrap"
+    description = "Formae production infrastructure on GCP"
+}
