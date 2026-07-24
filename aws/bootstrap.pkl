@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: FSL-1.1-ALv2
  */
 
-amends "@formae/forma.pkl"
+extends "@formae/forma.pkl"
 import "@formae/formae.pkl"
 import "@aws/aws.pkl"
 
@@ -65,151 +65,118 @@ description {
     confirm = true
 }
 
-properties {
+properties: Props
+
+class Props {
     // ── Shared ────────────────────────────────────────────────────────────────
-    // Access mode: "alb" (public HTTPS + basic auth) or "tailnet" (private, Tailscale).
-    access = new formae.Prop {
-        flag = "access"
-        default = "alb"
-    }
-    name = new formae.Prop {
-        flag = "name"
-        default = vars.projectName
-    }
-    // --region/--aws-profile govern the LOCAL apply credentials (which build the infra),
-    // not the deployed agent (which authenticates via its ECS task role). The flag is
-    // --aws-profile, not --profile, which formae reserves for its own CLI profiles.
-    region = new formae.Prop {
-        flag = "region"
-        default = vars.region
-    }
-    profile = new formae.Prop {
-        flag = "aws-profile"
-        default = ""
-    }
-    // ECS Fargate t-shirt size; maps to a Fargate-legal cpu/memory pair (see sizing.pkl).
-    size = new formae.Prop {
-        flag = "size"
-        default = "small"
-    }
-    // "new" provisions an RDS database; "existing" points the agent at one you run.
-    database = new formae.Prop {
-        flag = "database"
-        default = "new"
-    }
-    // Full agent image reference — stock ghcr, an ECR mirror, or a custom image with extra
-    // plugins. Upgrade the agent by re-applying with a newer tag/ref (ECS rolls the task).
-    formaeImage = new formae.Prop {
-        flag = "formae-image"
-        default = vars.formaeImage
-    }
-    // Basic-auth username for the agent API (both modes).
-    apiUser = new formae.Prop {
-        flag = "api-user"
-        default = "formae"
-    }
-    // Basic-auth password as a BCRYPT HASH (not plaintext), required in both modes.
-    // Generate locally: aws/scripts/gen-api-credential.sh (htpasswd -nbBC 10 "" <pw> | cut -d: -f2).
-    // Stored in an in-stack Secrets Manager secret and injected at task start.
-    apiPasswordHash = new formae.Prop {
-        flag = "api-password-hash"
-        default = ""
-    }
+    /// Access mode: "alb" (public HTTPS + basic auth) or "tailnet" (private, Tailscale).
+    access: String = "alb"
+
+    name: String = vars.projectName
+
+    /// --region/--aws-profile govern the LOCAL apply credentials (which build the infra),
+    /// not the deployed agent (which authenticates via its ECS task role).
+    region: String = vars.region
+
+    /// The flag is --aws-profile, not --profile, which formae reserves for its own CLI profiles.
+    @formae.Flag { name = "aws-profile" }
+    profile: String = ""
+
+    /// ECS Fargate t-shirt size; maps to a Fargate-legal cpu/memory pair (see sizing.pkl).
+    size: String = "small"
+
+    /// "new" provisions an RDS database; "existing" points the agent at one you run.
+    database: String = "new"
+
+    /// Full agent image reference — stock ghcr, an ECR mirror, or a custom image with extra
+    /// plugins. Upgrade the agent by re-applying with a newer tag/ref (ECS rolls the task).
+    @formae.Flag { name = "formae-image" }
+    formaeImage: String = vars.formaeImage
+
+    /// Basic-auth username for the agent API (both modes).
+    @formae.Flag { name = "api-user" }
+    apiUser: String = "formae"
+
+    /// Basic-auth password as a BCRYPT HASH (not plaintext), required in both modes.
+    /// Generate locally: aws/scripts/gen-api-credential.sh (htpasswd -nbBC 10 "" <pw> | cut -d: -f2).
+    /// Stored in an in-stack Secrets Manager secret and injected at task start.
+    @formae.Flag { name = "api-password-hash" }
+    apiPasswordHash: String = ""
 
     // ── alb mode ────────────────────────────────────────────────────────────────
-    // ARN of an ACM certificate (same region) for a domain you own. Required for --access alb.
-    certArn = new formae.Prop {
-        flag = "cert-arn"
-        default = ""
-    }
-    // The hostname clients connect to (must match the cert). Point its DNS at the ALB.
-    domain = new formae.Prop {
-        flag = "domain"
-        default = ""
-    }
-    // Optionally narrow ALB ingress to one CIDR (e.g. "203.0.113.4/32") instead of 0.0.0.0/0.
-    allowCidr = new formae.Prop {
-        flag = "allow-cidr"
-        default = ""
-    }
+    /// ARN of an ACM certificate (same region) for a domain you own. Required for --access alb.
+    @formae.Flag { name = "cert-arn" }
+    certArn: String = ""
+
+    /// The hostname clients connect to (must match the cert). Point its DNS at the ALB.
+    domain: String = ""
+
+    /// Optionally narrow ALB ingress to one CIDR (e.g. "203.0.113.4/32") instead of 0.0.0.0/0.
+    @formae.Flag { name = "allow-cidr" }
+    allowCidr: String = ""
 
     // ── tailnet mode ──────────────────────────────────────────────────────────────
-    // A reusable Tailscale auth key. Required for --access tailnet. Stored in an in-stack
-    // Secrets Manager secret and injected at task start; the agent joins the tailnet with it.
-    tsAuthkey = new formae.Prop {
-        flag = "ts-authkey"
-        default = ""
-    }
-    // The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
-    tsHostname = new formae.Prop {
-        flag = "ts-hostname"
-        default = ""
-    }
+    /// A reusable Tailscale auth key. Required for --access tailnet. Stored in an in-stack
+    /// Secrets Manager secret and injected at task start; the agent joins the tailnet with it.
+    @formae.Flag { name = "ts-authkey" }
+    tsAuthkey: String = ""
+
+    /// The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
+    @formae.Flag { name = "ts-hostname" }
+    tsHostname: String = ""
 
     // ── existing-database connection (consumed only when --database=existing) ─────
-    dbHost = new formae.Prop {
-        flag = "db-host"
-        default = ""
-    }
-    dbPort = new formae.Prop {
-        flag = "db-port"
-        default = "5432"
-    }
-    dbUser = new formae.Prop {
-        flag = "db-user"
-        default = ""
-    }
-    dbName = new formae.Prop {
-        flag = "db-name"
-        default = ""
-    }
-    dbPasswordSecretArn = new formae.Prop {
-        flag = "db-password-secret-arn"
-        default = ""
-    }
+    @formae.Flag { name = "db-host" }
+    dbHost: String = ""
+
+    @formae.Flag { name = "db-port" }
+    dbPort: String = "5432"
+
+    @formae.Flag { name = "db-user" }
+    dbUser: String = ""
+
+    @formae.Flag { name = "db-name" }
+    dbName: String = ""
+
+    @formae.Flag { name = "db-password-secret-arn" }
+    dbPasswordSecretArn: String = ""
 
     // ── VPC + subnet CIDRs ────────────────────────────────────────────────────────
-    // Subnets MUST sit within the VPC CIDR (AWS rejects mismatches).
-    vpcCidr = new formae.Prop {
-        flag = "vpc-cidr"
-        default = vars.vpcCidr
-    }
-    subnetCidr1 = new formae.Prop {
-        flag = "subnet-cidr-1"
-        default = vars.subnetCidr1
-    }
-    subnetCidr2 = new formae.Prop {
-        flag = "subnet-cidr-2"
-        default = vars.subnetCidr2
-    }
-    // Availability zones for the two subnets. Default to <region>a / <region>b, but some
-    // regions don't offer contiguous letters (e.g. us-west-1 has a + c, not b) — set these then.
-    az1 = new formae.Prop {
-        flag = "az-1"
-        default = ""
-    }
-    az2 = new formae.Prop {
-        flag = "az-2"
-        default = ""
-    }
+    /// Subnets MUST sit within the VPC CIDR (AWS rejects mismatches).
+    @formae.Flag { name = "vpc-cidr" }
+    vpcCidr: String = vars.vpcCidr
+
+    @formae.Flag { name = "subnet-cidr-1" }
+    subnetCidr1: String = vars.subnetCidr1
+
+    @formae.Flag { name = "subnet-cidr-2" }
+    subnetCidr2: String = vars.subnetCidr2
+
+    /// Availability zones for the two subnets. Default to <region>a / <region>b, but some
+    /// regions don't offer contiguous letters (e.g. us-west-1 has a + c, not b) — set these then.
+    @formae.Flag { name = "az-1" }
+    az1: String = ""
+
+    @formae.Flag { name = "az-2" }
+    az2: String = ""
 }
 
 // Access mode, validated. Rejects flags that belong to the other mode so mistakes fail
 // fast with a clear message rather than being silently ignored.
 local access =
-    let (a = properties.access.value)
+    let (a = properties.access)
         if (a != "alb" && a != "tailnet")
             throw("--access must be \"alb\" or \"tailnet\" (got \"\(a)\")")
-        else if (a == "tailnet" && (properties.certArn.value != "" || properties.domain.value != "" || properties.allowCidr.value != ""))
+        else if (a == "tailnet" && (properties.certArn != "" || properties.domain != "" || properties.allowCidr != ""))
             throw("--cert-arn, --domain and --allow-cidr apply only to --access alb")
-        else if (a == "alb" && properties.tsAuthkey.value != "")
+        else if (a == "alb" && properties.tsAuthkey != "")
             throw("--ts-authkey applies only to --access tailnet")
         else a
 local isAlb = access == "alb"
 local isTailnet = access == "tailnet"
-local isNew = properties.database.value == "new"
+local isNew = properties.database == "new"
 
-local n = properties.name.value
+local n = properties.name
 
 // Validate CIDR shape early (clearer than a slow AWS round-trip). AWS still enforces
 // subnet-within-VPC containment, so an out-of-range subnet is caught at apply.
@@ -217,51 +184,51 @@ local cidrRegex = Regex(#"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"#)
 local function asCidr(value: String, flag: String): String =
     if (value.matches(cidrRegex)) value
     else throw("\(flag) must be a CIDR like 10.0.0.0/16, got: \(value)")
-local vpcCidrVal = asCidr(properties.vpcCidr.value, "--vpc-cidr")
-local subnetCidr1Val = asCidr(properties.subnetCidr1.value, "--subnet-cidr-1")
-local subnetCidr2Val = asCidr(properties.subnetCidr2.value, "--subnet-cidr-2")
+local vpcCidrVal = asCidr(properties.vpcCidr, "--vpc-cidr")
+local subnetCidr1Val = asCidr(properties.subnetCidr1, "--subnet-cidr-1")
+local subnetCidr2Val = asCidr(properties.subnetCidr2, "--subnet-cidr-2")
 local natSubnetCidrVal = asCidr(vars.natSubnetCidr, "natSubnetCidr")
 
 // Subnet AZs: explicit --az-1/--az-2 win, else derive <region>a / <region>b. Override for
 // regions with non-contiguous zones (us-west-1 offers a + c, not b).
-local az1 = if (properties.az1.value != "") properties.az1.value else "\(properties.region.value)a"
-local az2 = if (properties.az2.value != "") properties.az2.value else "\(properties.region.value)b"
+local az1 = if (properties.az1 != "") properties.az1 else "\(properties.region)a"
+local az2 = if (properties.az2 != "") properties.az2 else "\(properties.region)b"
 
-local taskSize = sizing.forSize(properties.size.value)
+local taskSize = sizing.forSize(properties.size)
 
 // Required inputs. certArnVal / tsAuthkeyVal are referenced only inside their own mode, so
 // those throws fire only when that mode is selected; apiPasswordHashVal feeds the shared
 // apiSecret (basic-auth is on in both modes), so it is required regardless of --access.
 local certArnVal =
-    if (properties.certArn.value == "") throw("--cert-arn is required for --access alb (an ACM certificate ARN for your domain)")
-    else properties.certArn.value
+    if (properties.certArn == "") throw("--cert-arn is required for --access alb (an ACM certificate ARN for your domain)")
+    else properties.certArn
 local apiPasswordHashVal =
-    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required (both modes). Generate it with aws/scripts/gen-api-credential.sh")
-    else properties.apiPasswordHash.value
+    if (properties.apiPasswordHash == "") throw("--api-password-hash is required (both modes). Generate it with aws/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash
 local tsAuthkeyVal =
-    if (properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
-    else properties.tsAuthkey.value
-local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+    if (properties.tsAuthkey == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
+    else properties.tsAuthkey
+local tsHostnameVal = if (properties.tsHostname == "") n else properties.tsHostname
 
 // ALB ingress CIDR: an explicit --allow-cidr wins, else open to all.
 local ingressCidr =
-    if (properties.allowCidr.value != "") asCidr(properties.allowCidr.value, "--allow-cidr")
+    if (properties.allowCidr != "") asCidr(properties.allowCidr, "--allow-cidr")
     else "0.0.0.0/0"
 
 // New mode resolves the host from the provisioned DB at runtime via $FORMAE_DB_HOST;
 // existing mode bakes the supplied host into the agent config at apply time.
 local dbHostExpr =
     if (isNew) "$FORMAE_DB_HOST"
-    else if (properties.dbHost.value == "") throw("--db-host is required when --database=existing")
-    else properties.dbHost.value
+    else if (properties.dbHost == "") throw("--db-host is required when --database=existing")
+    else properties.dbHost
 local dbUserExpr =
     if (isNew) vars.dbUser
-    else if (properties.dbUser.value == "") throw("--db-user is required when --database=existing")
-    else properties.dbUser.value
+    else if (properties.dbUser == "") throw("--db-user is required when --database=existing")
+    else properties.dbUser
 local dbNameExpr =
     if (isNew) vars.dbName
-    else if (properties.dbName.value == "") throw("--db-name is required when --database=existing")
-    else properties.dbName.value
+    else if (properties.dbName == "") throw("--db-name is required when --database=existing")
+    else properties.dbName
 
 // Every bootstrap-tier resource carries Name + app=formae-agent; the latter lets the agent's
 // own discovery filter (emitted into the config below) suppress this stack's substrate.
@@ -286,7 +253,7 @@ local agentBody = """
   auth = new AuthBasic.AgentConfig {
     authorizedUsers {
       new AuthBasic.AuthorizedUser {
-        username = "\(properties.apiUser.value)"
+        username = "\(properties.apiUser)"
         password = "$FORMAE_API_PASSWORD_HASH"
       }
     }
@@ -298,7 +265,7 @@ local agentBody = """
     datastoreType = "postgres"
     postgres {
       host = "\(dbHostExpr)"
-      port = \(properties.dbPort.value)
+      port = \(properties.dbPort)
       user = "\(dbUserExpr)"
       password = "$FORMAE_DB_PASSWORD"
       database = "\(dbNameExpr)"
@@ -413,8 +380,8 @@ forma {
     new formae.Target {
         label = "bootstrap-target"
         config = new aws.Config {
-            region = properties.region.value
-            profile = if (properties.profile.value == "") null else properties.profile.value
+            region = properties.region
+            profile = if (properties.profile == "") null else properties.profile
         }
     }
 
@@ -935,7 +902,7 @@ local taskDef = new taskdefinition.TaskDefinition {
     containerDefinitions {
         new taskdefinition.ContainerDefinition {
             name = "formae-agent"
-            image = properties.formaeImage.value
+            image = properties.formaeImage
             essential = true
             entryPoint { "sh"; "-c" }
             command { configScript }
@@ -962,8 +929,8 @@ local taskDef = new taskdefinition.TaskDefinition {
                     name = "FORMAE_DB_PASSWORD"
                     valueFrom =
                         if (isNew) dbSecret.res.arn
-                        else if (properties.dbPasswordSecretArn.value == "") throw("--db-password-secret-arn is required when --database=existing")
-                        else properties.dbPasswordSecretArn.value
+                        else if (properties.dbPasswordSecretArn == "") throw("--db-password-secret-arn is required when --database=existing")
+                        else properties.dbPasswordSecretArn
                 }
                 new taskdefinition.Secret {
                     name = "FORMAE_API_PASSWORD_HASH"
@@ -989,7 +956,7 @@ local taskDef = new taskdefinition.TaskDefinition {
                 logDriver = "awslogs"
                 options {
                     ["awslogs-group"] = "/ecs/\(n)"
-                    ["awslogs-region"] = properties.region.value
+                    ["awslogs-region"] = properties.region
                     ["awslogs-stream-prefix"] = "formae"
                 }
             }

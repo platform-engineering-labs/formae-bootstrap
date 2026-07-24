@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: FSL-1.1-ALv2
  */
 
-amends "@formae/forma.pkl"
+extends "@formae/forma.pkl"
 import "@formae/formae.pkl"
 import "@gcp/gcp.pkl"
 
@@ -67,113 +67,88 @@ description {
     confirm = true
 }
 
-properties {
-    // GCP project the agent's infrastructure lives in. Required.
-    project = new formae.Prop {
-        flag = "project"
-        default = vars.project
-    }
-    name = new formae.Prop {
-        flag = "name"
-        default = vars.projectName
-    }
-    region = new formae.Prop {
-        flag = "region"
-        default = vars.region
-    }
-    zone = new formae.Prop {
-        flag = "zone"
-        default = vars.zone
-    }
-    // Access mode: "public" (public HTTPS LB + basic auth) or "tailnet" (private,
-    // Tailscale). Defaults to tailnet to preserve the prior single-mode behavior.
-    access = new formae.Prop {
-        flag = "access"
-        default = "tailnet"
-    }
-    // GCE t-shirt size; maps to a machine type (see sizing.pkl).
-    size = new formae.Prop {
-        flag = "size"
-        default = "small"
-    }
-    // Full agent image reference. Upgrade the agent by re-applying with a newer tag.
-    formaeImage = new formae.Prop {
-        flag = "formae-image"
-        default = vars.formaeImage
-    }
-    // Basic-auth username for the agent API.
-    apiUser = new formae.Prop {
-        flag = "api-user"
-        default = "formae"
-    }
-    // Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
-    // gcp/scripts/gen-api-credential.sh. Stored in a Secret Manager SecretVersion.
-    apiPasswordHash = new formae.Prop {
-        flag = "api-password-hash"
-        default = ""
-    }
-    // Cloud SQL postgres-user password. Supplied (not generated in-forma) so the
-    // value is stable across applies; gen-api-credential.sh prints one.
-    dbPassword = new formae.Prop {
-        flag = "db-password"
-        default = ""
-    }
+properties: Props
+
+class Props {
+    /// GCP project the agent's infrastructure lives in. Required.
+    project: String = vars.project
+
+    name: String = vars.projectName
+
+    region: String = vars.region
+
+    zone: String = vars.zone
+
+    /// Access mode: "public" (public HTTPS LB + basic auth) or "tailnet" (private,
+    /// Tailscale). Defaults to tailnet to preserve the prior single-mode behavior.
+    access: String = "tailnet"
+
+    /// GCE t-shirt size; maps to a machine type (see sizing.pkl).
+    size: String = "small"
+
+    /// Full agent image reference. Upgrade the agent by re-applying with a newer tag.
+    @formae.Flag { name = "formae-image" }
+    formaeImage: String = vars.formaeImage
+
+    /// Basic-auth username for the agent API.
+    @formae.Flag { name = "api-user" }
+    apiUser: String = "formae"
+
+    /// Basic-auth password as a BCRYPT HASH (not plaintext). Generate locally with
+    /// gcp/scripts/gen-api-credential.sh. Stored in a Secret Manager SecretVersion.
+    @formae.Flag { name = "api-password-hash" }
+    apiPasswordHash: String = ""
+
+    /// Cloud SQL postgres-user password. Supplied (not generated in-forma) so the
+    /// value is stable across applies; gen-api-credential.sh prints one.
+    @formae.Flag { name = "db-password" }
+    dbPassword: String = ""
 
     // ── public mode ───────────────────────────────────────────────────────────
-    // Name of a pre-created global SslCertificate to reference on the HTTPS proxy.
-    // The AWS --cert-arn analog: keeps the private key out of formae entirely.
-    // Mutually exclusive with --cert-file/--key-file.
-    certName = new formae.Prop {
-        flag = "cert-name"
-        default = ""
-    }
-    // Path to a PEM certificate chain (read at apply time). Creates a SELF_MANAGED
-    // SslCertificate in-stack. Requires --key-file.
-    certFile = new formae.Prop {
-        flag = "cert-file"
-        default = ""
-    }
-    // Path to the matching PEM private key (read at apply time, stored opaque so it
-    // never lands readably in plans/state).
-    keyFile = new formae.Prop {
-        flag = "key-file"
-        default = ""
-    }
-    // The hostname clients connect to (must match the certificate). Informational:
-    // point its DNS A record at the reserved global address the stack prints.
-    domain = new formae.Prop {
-        flag = "domain"
-        default = ""
-    }
+    /// Name of a pre-created global SslCertificate to reference on the HTTPS proxy.
+    /// The AWS --cert-arn analog: keeps the private key out of formae entirely.
+    /// Mutually exclusive with --cert-file/--key-file.
+    @formae.Flag { name = "cert-name" }
+    certName: String = ""
+
+    /// Path to a PEM certificate chain (read at apply time). Creates a SELF_MANAGED
+    /// SslCertificate in-stack. Requires --key-file.
+    @formae.Flag { name = "cert-file" }
+    certFile: String = ""
+
+    /// Path to the matching PEM private key (read at apply time, stored opaque so it
+    /// never lands readably in plans/state).
+    @formae.Flag { name = "key-file" }
+    keyFile: String = ""
+
+    /// The hostname clients connect to (must match the certificate). Informational:
+    /// point its DNS A record at the reserved global address the stack prints.
+    domain: String = ""
 
     // ── tailnet mode ──────────────────────────────────────────────────────────
-    // A reusable Tailscale auth key (tagged tag:formae). Required for --access tailnet.
-    // Stored in Secret Manager; the agent joins the tailnet with it.
-    tsAuthkey = new formae.Prop {
-        flag = "ts-authkey"
-        default = ""
-    }
-    // The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
-    tsHostname = new formae.Prop {
-        flag = "ts-hostname"
-        default = ""
-    }
-    subnetCidr = new formae.Prop {
-        flag = "subnet-cidr"
-        default = vars.subnetCidr
-    }
+    /// A reusable Tailscale auth key (tagged tag:formae). Required for --access tailnet.
+    /// Stored in Secret Manager; the agent joins the tailnet with it.
+    @formae.Flag { name = "ts-authkey" }
+    tsAuthkey: String = ""
+
+    /// The tailnet (MagicDNS) hostname the agent registers as. Defaults to --name.
+    @formae.Flag { name = "ts-hostname" }
+    tsHostname: String = ""
+
+    @formae.Flag { name = "subnet-cidr" }
+    subnetCidr: String = vars.subnetCidr
 }
 
 // ── Mode + validation ─────────────────────────────────────────────────────────
 // AWS-style fail-fast validation: reject cross-mode flags and missing cert inputs
 // with clear messages before any slow cloud round-trip.
 local access =
-    let (a = properties.access.value)
+    let (a = properties.access)
         if (a != "public" && a != "tailnet")
             throw("--access must be \"public\" or \"tailnet\" (got \"\(a)\")")
-        else if (a == "tailnet" && (properties.certName.value != "" || properties.certFile.value != "" || properties.keyFile.value != "" || properties.domain.value != ""))
+        else if (a == "tailnet" && (properties.certName != "" || properties.certFile != "" || properties.keyFile != "" || properties.domain != ""))
             throw("--cert-name, --cert-file, --key-file and --domain apply only to --access public")
-        else if (a == "public" && (properties.tsAuthkey.value != "" || properties.tsHostname.value != ""))
+        else if (a == "public" && (properties.tsAuthkey != "" || properties.tsHostname != ""))
             throw("--ts-authkey and --ts-hostname apply only to --access tailnet")
         else a
 
@@ -181,10 +156,10 @@ local isPublic = access == "public"
 local isTailnet = access == "tailnet"
 
 // Cert inputs (public only): exactly one of --cert-name XOR (--cert-file AND --key-file).
-local certNameVal = properties.certName.value
-local certFileVal = properties.certFile.value
-local keyFileVal = properties.keyFile.value
-local domainVal = properties.domain.value
+local certNameVal = properties.certName
+local certFileVal = properties.certFile
+local keyFileVal = properties.keyFile
+local domainVal = properties.domain
 // Three cert sources under --access public (exactly one):
 //   --cert-file + --key-file -> in-stack SELF_MANAGED cert from your PEMs
 //   --cert-name              -> reference a pre-created cert by name
@@ -217,29 +192,29 @@ local cidrRegex = Regex(#"^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$"#)
 local function asCidr(value: String, flag: String): String =
     if (value.matches(cidrRegex)) value
     else throw("\(flag) must be a CIDR like 10.0.0.0/16, got: \(value)")
-local subnetCidrVal = asCidr(properties.subnetCidr.value, "--subnet-cidr")
+local subnetCidrVal = asCidr(properties.subnetCidr, "--subnet-cidr")
 
 // ── Required inputs ───────────────────────────────────────────────────────────
 local projectVal =
-    if (properties.project.value == "") throw("--project is required (the GCP project ID)")
-    else properties.project.value
+    if (properties.project == "") throw("--project is required (the GCP project ID)")
+    else properties.project
 local apiPasswordHashVal =
-    if (properties.apiPasswordHash.value == "") throw("--api-password-hash is required (both modes). Generate it with gcp/scripts/gen-api-credential.sh")
-    else properties.apiPasswordHash.value
+    if (properties.apiPasswordHash == "") throw("--api-password-hash is required (both modes). Generate it with gcp/scripts/gen-api-credential.sh")
+    else properties.apiPasswordHash
 local dbPasswordVal =
-    if (properties.dbPassword.value == "") throw("--db-password is required (a stable Cloud SQL postgres password; gen-api-credential.sh prints one)")
-    else properties.dbPassword.value
+    if (properties.dbPassword == "") throw("--db-password is required (a stable Cloud SQL postgres password; gen-api-credential.sh prints one)")
+    else properties.dbPassword
 // tsAuthkey is referenced only under tailnet, so this throw fires only then.
 local tsAuthkeyVal =
     if (!isTailnet) ""
-    else if (properties.tsAuthkey.value == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
-    else properties.tsAuthkey.value
+    else if (properties.tsAuthkey == "") throw("--ts-authkey is required for --access tailnet (a reusable Tailscale auth key)")
+    else properties.tsAuthkey
 
-local n = properties.name.value
-local regionVal = properties.region.value
-local zoneVal = properties.zone.value
-local machineTypeVal = sizing.forSize(properties.size.value)
-local tsHostnameVal = if (properties.tsHostname.value == "") n else properties.tsHostname.value
+local n = properties.name
+local regionVal = properties.region
+local zoneVal = properties.zone
+local machineTypeVal = sizing.forSize(properties.size)
+local tsHostnameVal = if (properties.tsHostname == "") n else properties.tsHostname
 // Cloud SQL connection name is deterministic: project:region:instance.
 local dbInstanceName = "\(n)-db"
 local dbConnName = "\(projectVal):\(regionVal):\(dbInstanceName)"
@@ -261,7 +236,7 @@ local agentBody = """
   auth = new AuthBasic.AgentConfig {
     authorizedUsers {
       new AuthBasic.AuthorizedUser {
-        username = "\(properties.apiUser.value)"
+        username = "\(properties.apiUser)"
         password = "$FORMAE_API_PASSWORD_HASH"
       }
     }
@@ -387,7 +362,7 @@ mkdir -p /var/formae
 cat > /var/formae/formae.conf.pkl << PKLEOF
 \(agentConfig)
 PKLEOF
-FORMAE_IMAGE="\(properties.formaeImage.value)"
+FORMAE_IMAGE="\(properties.formaeImage)"
 retry docker pull "$FORMAE_IMAGE"
 docker rm -f formae-agent >/dev/null 2>&1 || true
 """
