@@ -1,0 +1,49 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+import "@formae/formae.pkl"
+
+projectName = "formae-bootstrap"
+// Azure subscription the agent's infrastructure lives in. Required (no sane default).
+subscriptionId = ""
+location = "eastus"
+vnetCidr = "10.100.0.0/16"
+// Subnet hosting the agent VM and the Postgres private endpoint.
+subnetCidr = "10.100.1.0/24"
+// appgw mode only: dedicated subnet for the Application Gateway (v2 requires its
+// own subnet, separate from the VM subnet).
+appgwSubnetCidr = "10.100.2.0/24"
+// appgw mode only: static private IP for the VM NIC so the Application Gateway
+// backend pool can target it by address. Must fall inside subnetCidr.
+vmPrivateIp = "10.100.1.4"
+
+// Azure Database for PostgreSQL Flexible Server.
+dbSkuName = "Standard_B1ms" // 1 vCPU / 2 GB
+dbSkuTier = "Burstable"
+dbStorageGb = 32
+dbVersion = "16"
+dbName = "formae"
+// Flexible Server rejects reserved admin logins (postgres, admin, root, ...).
+dbUser = "formae"
+
+// Ubuntu LTS for the agent VM (docker.io installed by the bootstrap script).
+vmImagePublisher = "Canonical"
+vmImageOffer = "0001-com-ubuntu-server-jammy"
+vmImageSku = "22_04-lts-gen2"
+vmImageVersion = "latest"
+vmAdminUser = "formae"
+osDiskSizeGb = 30
+
+formaeImage = "ghcr.io/platform-engineering-labs/formae:0.87.0"
+formaePort = 49684
+
+stack: formae.Stack = new {
+    // Cloud-scoped label (aws/ uses "formae-bootstrap", gcp/ uses
+    // "formae-gcp-bootstrap"): stack labels are unique per agent, so a
+    // cloud-neutral label would reconcile-away another cloud's records.
+    label = "formae-bootstrap-azure"
+    description = "Formae production infrastructure on Azure"
+}

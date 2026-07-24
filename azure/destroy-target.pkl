@@ -1,0 +1,22 @@
+/*
+ * © 2025 Platform Engineering Labs Inc.
+ *
+ * SPDX-License-Identifier: FSL-1.1-ALv2
+ */
+
+// Deregisters the bootstrap-target (the inverse of the target registered by
+// bootstrap.pkl). Identified by label; config just needs to match the
+// registered target.
+amends "@formae/forma.pkl"
+import "@formae/formae.pkl"
+import "@azure/azure.pkl"
+import "./vars.pkl"
+
+forma {
+    new formae.Target {
+        label = "azure-bootstrap-target"
+        config = new azure.Config {
+            subscriptionId = vars.subscriptionId
+        }
+    }
+}

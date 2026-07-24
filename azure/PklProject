@@ -1,0 +1,14 @@
+amends "pkl:Project"
+
+dependencies {
+  ["formae"] {
+    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.87.0"
+  }
+
+  // appgw mode needs App Gateway KV-cert wiring + KeyVault::Certificate + identity
+  // + role assignment, released in the azure plugin 0.1.8. public/tailnet work
+  // with any 0.1.x.
+  ["azure"] {
+    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.8"
+  }
+}
