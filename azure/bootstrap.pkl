@@ -231,11 +231,14 @@ local dbFqdn = "\(dbServerName).postgres.database.azure.com"
 // public mode: the stable DNS name the self-signed certificate is issued for.
 local agentFqdn = "\(n).\(loc).cloudapp.azure.com"
 
-// Every bootstrap-tier resource carries the app=formae-agent tag so the agent's
+// Every bootstrap-tier resource carries app=formae-agent and formae-owned=true so the agent's
 // own discovery filter (emitted into the config below) can suppress this stack's
 // substrate rather than surfacing it as unmanaged drift.
 local commonTags: Listing<azure.Tag> = new {
     new azure.Tag { key = "app"; value = "formae-agent" }
+    // The marker discovery suppresses on, spelled identically on AWS and GCP. app stays as a
+    // descriptive tag for portals and cost allocation; it is no longer what filtering keys on.
+    new azure.Tag { key = "formae-owned"; value = "true" }
 }
 
 // ── Agent config file (written on the VM by the bootstrap script) ─────────────
@@ -300,7 +303,9 @@ agent {
   }
   resourcePlugins {
     new Azure.PluginConfig {
-      // Suppress this agent's own substrate (everything tagged app=formae-agent)
+      // Suppress this agent's own substrate (everything tagged formae-owned=true). Recent
+      // plugins carry a built-in filter for the same marker; this block is what covers an
+      // agent older than that, so it stays until a minimum plugin version is declared.
       // from discovery so it is not surfaced as unmanaged drift. NOTE: the exact
       // Azure tag filter path is provider-specific and must be validated against
       // a live discovery run; adjust the propertyPath if the substrate still leaks.
@@ -308,8 +313,11 @@ agent {
         new MatchFilter {
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.tags.app"
-              propertyValue = "formae-agent"
+              // Tags reach discovery as an array of {Key, Value} objects under an
+              // uppercase "Tags", not the lowercase map ARM uses. The previous
+              // "$.tags.app" path matched nothing for the same reason.
+              propertyPath = "$.Tags[?(@.Key=='formae-owned')].Value"
+              propertyValue = "true"
             }
           }
         }
