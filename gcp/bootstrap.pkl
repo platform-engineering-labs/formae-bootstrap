@@ -219,11 +219,14 @@ local tsHostnameVal = if (properties.tsHostname == "") n else properties.tsHostn
 local dbInstanceName = "\(n)-db"
 local dbConnName = "\(projectVal):\(regionVal):\(dbInstanceName)"
 
-// Every bootstrap-tier resource carries the app=formae-agent label so the agent's
+// Every bootstrap-tier resource carries app=formae-agent and formae-owned=true so the agent's
 // own discovery filter (emitted into the config below) can suppress this stack's
 // substrate rather than surfacing it as unmanaged drift.
 local commonLabels: Mapping<String, String> = new {
     ["app"] = "formae-agent"
+    // The marker discovery suppresses on, spelled identically on AWS and Azure. A GCP label key
+    // cannot hold a colon, which is why the marker is hyphenated on all three clouds.
+    ["formae-owned"] = "true"
 }
 
 // ── Agent config file (written on the VM by the startup script) ───────────────
@@ -265,7 +268,9 @@ local agentBody = """
   }
   resourcePlugins {
     new Gcp.PluginConfig {
-      // Suppress this agent's own substrate (everything labeled app=formae-agent)
+      // Suppress this agent's own substrate (everything labeled formae-owned=true). Recent
+      // plugins carry a built-in filter for the same marker; this block is what covers an
+      // agent older than that, so it stays until a minimum plugin version is declared.
       // from discovery so it is not surfaced as unmanaged drift. NOTE: the exact
       // GCP label filter path is provider-specific and must be validated against a
       // live discovery run; adjust the propertyPath if the substrate still leaks.
@@ -273,8 +278,8 @@ local agentBody = """
         new MatchFilter {
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.labels.app"
-              propertyValue = "formae-agent"
+              propertyPath = "$.labels['formae-owned']"
+              propertyValue = "true"
             }
           }
         }

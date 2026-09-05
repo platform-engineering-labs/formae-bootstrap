@@ -230,11 +230,15 @@ local dbNameExpr =
     else if (properties.dbName == "") throw("--db-name is required when --database=existing")
     else properties.dbName
 
-// Every bootstrap-tier resource carries Name + app=formae-agent; the latter lets the agent's
-// own discovery filter (emitted into the config below) suppress this stack's substrate.
+// Every bootstrap-tier resource carries Name, app=formae-agent and formae-owned=true.
+// formae-owned is the marker discovery suppresses on: it is the same key on AWS, Azure and
+// GCP, and recent plugins carry a built-in filter for it, so this substrate stays hidden even
+// where no operator filter is configured. app stays as a descriptive tag for consoles and cost
+// allocation; it is no longer what the filtering keys on.
 local function tagged(nm: String): Listing<aws.Tag> = new {
     new { key = "Name"; value = nm }
     new { key = "app"; value = "formae-agent" }
+    new { key = "formae-owned"; value = "true" }
 }
 
 // The two subnets the agent + database live in, and the SG the agent task uses — both differ
@@ -282,8 +286,10 @@ local agentBody = """
   }
   resourcePlugins {
     new Aws.PluginConfig {
-      // Suppress this agent's own substrate (everything tagged app=formae-agent) from
-      // discovery, so it isn't surfaced as unmanaged drift. Multiple MatchFilters are OR'd;
+      // Suppress this agent's own substrate (everything tagged formae-owned=true) from
+      // discovery, so it isn't surfaced as unmanaged drift. Recent plugins carry a built-in
+      // filter for the same marker; this block is what covers an agent older than that, so it
+      // stays until a minimum plugin version is declared. Multiple MatchFilters are OR'd;
       // conditions within one are AND'd (a resource is excluded when any filter's conditions
       // all match). Most AWS types carry tags at $.Tags — but EFS is special: FileSystem and
       // AccessPoint expose tags under FileSystemTags / AccessPointTags, so a single $.Tags
@@ -312,8 +318,8 @@ local agentBody = """
           }
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.Tags[?(@.Key=='app')].Value"
-              propertyValue = "formae-agent"
+              propertyPath = "$.Tags[?(@.Key=='formae-owned')].Value"
+              propertyValue = "true"
             }
           }
         }
@@ -321,8 +327,8 @@ local agentBody = """
           resourceTypes = new Listing { "AWS::EFS::FileSystem" }
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.FileSystemTags[?(@.Key=='app')].Value"
-              propertyValue = "formae-agent"
+              propertyPath = "$.FileSystemTags[?(@.Key=='formae-owned')].Value"
+              propertyValue = "true"
             }
           }
         }
@@ -330,8 +336,8 @@ local agentBody = """
           resourceTypes = new Listing { "AWS::EFS::AccessPoint" }
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.AccessPointTags[?(@.Key=='app')].Value"
-              propertyValue = "formae-agent"
+              propertyPath = "$.AccessPointTags[?(@.Key=='formae-owned')].Value"
+              propertyValue = "true"
             }
           }
         }
