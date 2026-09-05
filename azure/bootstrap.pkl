@@ -313,7 +313,10 @@ agent {
         new MatchFilter {
           conditions = new Listing {
             new FilterCondition {
-              propertyPath = "$.tags['formae-owned']"
+              // Tags reach discovery as an array of {Key, Value} objects under an
+              // uppercase "Tags", not the lowercase map ARM uses. The previous
+              // "$.tags.app" path matched nothing for the same reason.
+              propertyPath = "$.Tags[?(@.Key=='formae-owned')].Value"
               propertyValue = "true"
             }
           }
