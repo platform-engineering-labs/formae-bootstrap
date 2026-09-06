@@ -63,11 +63,13 @@ first re-apply of this version over such an installation is rejected at plan
 time, naming the field. The apply changes nothing when refused. Migrate in two
 applies, both with your usual flags:
 
-1. Edit `bootstrap.pkl` to the transitional shape — restore the old line but
-   without `.setOnce`, and leave the generator out of the manifest:
-   `secretString = formae.value(random.password(24, false)).opaque`. Apply.
-   This re-mints the password once and releases the `setOnce` pin; the database
-   follows the new value in the same apply.
+1. Edit `bootstrap.pkl` to the transitional shape: add
+   `import "@formae/ext/random.pkl"` back to the import block, change the
+   secret's line to
+   `secretString = formae.value(random.password(24, false)).opaque`
+   (the old line without `.setOnce`), and remove `dbPasswordGen` from the
+   manifest. Apply. This re-mints the password once and releases the `setOnce`
+   pin; the database follows the new value in the same apply.
 2. Revert to this version's `bootstrap.pkl` as shipped and apply again. The
    generator draws, and the secret and database move together; from here on the
    password is generator-owned.
