@@ -29,12 +29,15 @@ Full instructions in [`aws/README.md`](aws/README.md).
 
 [`azure/`](azure/) installs a production formae agent on a VM, backed by Azure Database for
 PostgreSQL Flexible Server reached through a private endpoint (no public database access).
-One command, two **secure** access modes — there is no plaintext option:
+One command, three **secure** access modes — there is no plaintext option:
 
-- **`public`** — the agent terminates HTTPS itself with a self-signed certificate, served at
-  a stable `<name>.<location>.cloudapp.azure.com` FQDN, plus HTTP basic auth.
+- **`public`** — the agent terminates HTTPS itself with **your certificate**
+  (`--cert-file`/`--key-file`/`--domain`), plus HTTP basic auth.
+- **`appgw`** — public HTTPS terminated by an Application Gateway v2 with **your PFX**
+  (`--cert-pfx`) held in a Key Vault the stack creates. The Azure analog of AWS `alb`.
 - **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress),
-  serving a trusted `*.ts.net` certificate, with basic auth on top.
+  serving a trusted `*.ts.net` certificate, with basic auth on top. No certificate of your own
+  needed.
 
 Full instructions in [`azure/README.md`](azure/README.md).
 

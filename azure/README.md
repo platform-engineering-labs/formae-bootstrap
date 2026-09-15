@@ -4,16 +4,19 @@ One command stands up a production **formae agent** on Azure — a resource grou
 the agent container, and an Azure Database for PostgreSQL Flexible Server (private endpoint,
 no public DB access) — secure by default, in one of three access modes:
 
-- **`public`** — the agent terminates HTTPS itself with a **self-signed certificate** generated
-  on the VM at first boot, reachable at a stable `<name>.<location>.cloudapp.azure.com` FQDN,
-  plus HTTP basic auth. Inbound restricted to `--allowed-cidr`.
-- **`appgw`** — public HTTPS terminated by an **Application Gateway v2** fronting the VM, with the
-  TLS cert stored as an **`AZURE::KeyVault::Certificate`** the stack provisions in a Key Vault it
-  creates (self-signed by default, or **your PFX** via `--cert-pfx`), read at runtime by a
-  user-assigned identity. The Azure analog of the AWS **`alb`** mode. Point `--domain`'s DNS at the
-  gateway's public IP; basic auth on top.
+- **`public`** — the agent terminates HTTPS itself with **your certificate** (`--cert-file` +
+  `--key-file` + `--domain`), written to the VM by the bootstrap script, plus HTTP basic auth.
+  Inbound restricted to `--allowed-cidr`.
+- **`appgw`** — public HTTPS terminated by an **Application Gateway v2** fronting the VM, with
+  **your PFX** (`--cert-pfx`) stored as an **`AZURE::KeyVault::Certificate`** the stack provisions
+  in a Key Vault it creates, read at runtime by a user-assigned identity. The Azure analog of the
+  AWS **`alb`** mode. Point `--domain`'s DNS at the gateway's public IP; basic auth on top.
 - **`tailnet`** — private, reached only over your Tailscale tailnet (no public ingress), serving
-  a trusted `*.ts.net` certificate, with basic auth on top.
+  a trusted `*.ts.net` certificate, with basic auth on top. **No certificate of your own needed.**
+
+> **Both public modes require a certificate your clients already trust.** The formae CLI has no
+> TLS-skip knob, so a self-signed certificate produces an agent nothing can connect to — the
+> bootstrap therefore refuses to generate one. Use `tailnet` for a certificate-free install.
 
 > **Requires the Azure plugin ≥ 0.1.10** (App Gateway KV-cert wiring, `AZURE::KeyVault::Certificate`,
 > user-assigned identity + role assignment). `appgw` mode will not resolve against older plugin
@@ -39,17 +42,18 @@ permanent home in the cloud, then point your CLI at it with a profile and hand o
 
 - An **SSH public key** (Azure requires one on the VM even if you never log in):
   `ssh-keygen -t ed25519` if you don't have one.
-- `public` mode: a formae CLI with `cli.api.insecureSkipVerify`
-  ([formae PR #540](https://github.com/platform-engineering-labs/formae/pull/540)) to accept
-  the self-signed certificate.
+- `public` mode:
+  - a **domain** you control (`--domain`) whose DNS you point at the VM's public IP after apply;
+  - a **PEM certificate chain and private key** for that domain (`--cert-file` / `--key-file`,
+    absolute paths, read at apply time). Let's Encrypt, an internal CA your clients trust, or any
+    commercial CA all work.
 - `appgw` mode:
   - a **domain** you control (`--domain`) whose DNS you point at the gateway's public IP after apply;
+  - a **PFX** for that domain (`--cert-pfx` base64 + `--cert-password` if it has one);
   - a **globally-unique Key Vault name** (`--kv-name`, 3–24 chars);
   - the applying principal's **objectId** (`--applier-object-id`) so the stack can grant it
     "Key Vault Certificates Officer" to create the cert (data-plane):
-    `az ad sp show --id <client-id> --query id -o tsv`;
-  - optionally a **PFX** (`--cert-pfx` base64 + `--cert-password`) for a browser-trusted cert;
-    omit for a self-signed cert (works, not trusted).
+    `az ad sp show --id <client-id> --query id -o tsv`.
 - `tailnet` mode: a reusable Tailscale auth key tagged `tag:formae`, HTTPS certificates
   enabled in the tailnet admin console.
 
@@ -70,15 +74,21 @@ azure/scripts/gen-api-credential.sh
 formae apply --mode reconcile azure/bootstrap.pkl --access public --location <location> \
   --subscription-id <sub-id> --tenant-id <tenant-id> \
   --client-id <sp-appId> --client-secret '<sp-password>' \
+  --domain agent.example.com \
+  --cert-file "$PWD/fullchain.pem" --key-file "$PWD/privkey.pem" \
   --api-user formae --api-password-hash '<hash>' --db-password '<dbpass>' \
-  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)" --watch
+  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)"
 
-# Verify + connect (self-signed cert: -k / insecureSkipVerify):
-curl -k https://formae-bootstrap.<location>.cloudapp.azure.com:49684/api/v1/health
+# Point agent.example.com's DNS at the VM's public IP (or CNAME it to
+# formae-bootstrap.<location>.cloudapp.azure.com), then verify + connect — no -k:
+curl https://agent.example.com:49684/api/v1/health
 azure/scripts/write-bootstrap-profile.sh --profile bootstrap --access public \
-  --fqdn formae-bootstrap.<location>.cloudapp.azure.com --user formae --password '<password>'
-formae status agent --profile bootstrap
+  --fqdn agent.example.com --user formae --password '<password>'
+formae agent status --profile bootstrap
 ```
+
+Rotate the certificate by re-applying with updated PEM files: the changed script re-runs the
+VM extension and restarts the agent with the new cert.
 
 **`appgw`** (public HTTPS via Application Gateway + a Key Vault cert):
 
@@ -88,16 +98,16 @@ formae apply --mode reconcile azure/bootstrap.pkl --access appgw --location <loc
   --client-id <sp-appId> --client-secret '<sp-password>' \
   --domain agent.example.com --kv-name <unique-kv-name> \
   --applier-object-id "$(az ad sp show --id <sp-appId> --query id -o tsv)" \
+  --cert-pfx "$(base64 -i cert.pfx)" --cert-password '<pw>' \
   --api-user formae --api-password-hash '<hash>' --db-password '<dbpass>' \
-  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)" --watch
-  # add --cert-pfx "$(base64 -i cert.pfx)" --cert-password '<pw>' for a trusted cert
+  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)"
 
-# Point agent.example.com's DNS at the gateway public IP (formae-bootstrap-gw.<location>.cloudapp.azure.com),
-# then (self-signed cert: -k; trusted PFX: drop -k):
-curl -k https://agent.example.com/api/v1/health
+# Point agent.example.com's DNS at the gateway public IP
+# (formae-bootstrap-gw.<location>.cloudapp.azure.com), then — no -k:
+curl https://agent.example.com/api/v1/health
 azure/scripts/write-bootstrap-profile.sh --profile bootstrap --access appgw \
   --fqdn agent.example.com --user formae --password '<password>'
-formae status agent --profile bootstrap
+formae agent status --profile bootstrap
 ```
 
 > **First apply may report the route/cert resolving before RBAC has propagated.** Key Vault role
@@ -112,12 +122,12 @@ formae apply --mode reconcile azure/bootstrap.pkl --access tailnet --location <l
   --client-id <sp-appId> --client-secret '<sp-password>' \
   --ts-authkey '<tskey>' --ts-hostname formae-bootstrap \
   --api-user formae --api-password-hash '<hash>' --db-password '<dbpass>' \
-  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)" --watch
+  --ssh-public-key "$(cat ~/.ssh/id_ed25519.pub)"
 
 # From a machine on the same tailnet:
 azure/scripts/write-bootstrap-profile.sh --profile bootstrap --access tailnet \
   --fqdn formae-bootstrap.<your-tailnet>.ts.net --user formae --password '<password>'
-formae status agent --profile bootstrap
+formae agent status --profile bootstrap
 ```
 
 ## Upgrading
@@ -132,8 +142,10 @@ depends on it.
 - **Secrets path.** The azure plugin cannot yet attach a managed identity to the VM, so the
   agent authenticates with the service principal, and all secrets reach the VM inside the
   CustomScript extension's `protectedSettings` (write-only, encrypted by Azure, never returned
-  by the API) instead of being fetched from a Key Vault at boot. When the plugin gains a VM
-  identity property, this moves to Key Vault + managed identity.
+  by the API) instead of being fetched from a Key Vault at boot. In `public` mode this includes
+  your TLS **private key**, which therefore also lands in your local formae datastore as part of
+  the extension's desired state — same exposure as the service principal secret and db password.
+  When the plugin gains a VM identity property, this moves to Key Vault + managed identity.
 - **Egress public IP.** The VM carries a public IP in *both* modes: Azure retired default
   outbound access for new VMs and the plugin has no NAT Gateway resource yet. In `tailnet`
   mode no NSG inbound rule exists, so nothing can reach the VM from the internet.
@@ -148,7 +160,7 @@ depends on it.
 
 | Flag | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `--access` | — | `public` | `public` (self-signed HTTPS), `appgw` (App Gateway + Key Vault cert), or `tailnet` |
+| `--access` | — | `public` | `public` (agent-terminated HTTPS, your PEM), `appgw` (App Gateway + Key Vault cert, your PFX), or `tailnet` |
 | `--location` | — | `eastus` | Azure region. Must accept new customers and offer PostgreSQL Flexible Server + the chosen VM size (see Troubleshooting) |
 | `--name` | — | `formae-bootstrap` | Prefix for every resource. **Must be globally unique** — it drives the PostgreSQL server FQDN (`<name>-db.postgres.database.azure.com`) and the public DNS label, both of which collide across subscriptions. Change it if the default is taken |
 | `--size` | — | `small` | `small`/`medium`/`large`/`xlarge` → Dsv6 VM sizes (see `sizing.pkl`; fresh subscriptions get 0 vCPU quota on B-series and v5 families, so Dsv6 is the default) |
@@ -158,10 +170,12 @@ depends on it.
 | `--db-password` | yes | — | Stable Postgres admin password. Reuse the **same** value on every re-apply |
 | `--ssh-public-key` | yes | — | Admin key on the VM (no inbound SSH rule is opened; see Troubleshooting) |
 | `--allowed-cidr` | — | `*` | `public` mode only: source CIDR allowed to the agent API. Tighten for production |
-| `--domain` | appgw | — | `appgw` mode only: hostname on the cert; point its DNS at the gateway public IP |
+| `--domain` | public, appgw | — | Hostname on your certificate; point its DNS at the VM (`public`) or gateway (`appgw`) public IP |
+| `--cert-file` / `--key-file` | public | — | `public` mode only: absolute paths to the PEM chain + private key for `--domain`, read at apply time |
+| `--cert-pfx` | appgw | — | `appgw` mode only: base64-encoded PFX for `--domain` |
+| `--cert-password` | — | — | `appgw` mode only: password for `--cert-pfx` (omit if passwordless) |
 | `--kv-name` | appgw | — | `appgw` mode only: globally-unique Key Vault name (3–24 chars) the stack creates |
 | `--applier-object-id` | appgw | — | `appgw` mode only: objectId of the applying principal (granted Certificates Officer on the vault) |
-| `--cert-pfx` / `--cert-password` | — | — | `appgw` mode only, optional: base64 PFX + password for a trusted cert (else self-signed) |
 | `--ts-authkey` / `--ts-hostname` | tailnet | — | `tailnet` mode only: reusable auth key tagged `tag:formae`, and the tailnet hostname |
 | `--vnet-cidr` / `--subnet-cidr` | — | `10.100.0.0/16` / `10.100.1.0/24` | Address space |
 | `--formae-image` | — | pinned in `vars.pkl` | Agent image; bump to upgrade |
@@ -186,5 +200,5 @@ Destroy the stack, then deregister the target:
 
 ```bash
 formae destroy --query "stack:formae-bootstrap-azure"
-formae apply --mode destroy azure/destroy-target.pkl
+formae destroy azure/destroy-target.pkl
 ```

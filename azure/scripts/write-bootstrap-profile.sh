@@ -6,24 +6,26 @@
 # Write a formae CLI profile that connects to an agent stood up by azure/bootstrap.pkl.
 # Run this AFTER `formae apply` succeeds.
 #
-# public mode serves HTTPS with a SELF-SIGNED certificate, so the profile sets
-# cli.api.insecureSkipVerify = true (needs a formae CLI with PR #540). tailnet
-# mode serves a trusted *.ts.net certificate; connect via the tailnet FQDN.
-# Both use the agent's listener port, 49684 (override with --port).
+# Every mode serves a certificate the CLI can verify: public and appgw use the
+# certificate you supplied at apply time (--fqdn is your --domain), tailnet
+# serves a trusted *.ts.net certificate (--fqdn is the tailnet FQDN). The CLI
+# has no TLS-skip knob, so there is nothing to opt out of here.
+# public and tailnet use the agent's listener port, 49684; appgw listens on 443
+# (the default flips automatically). Override with --port.
 #
 # auth-basic ships in the standard plugin bundle installed with the formae CLI, so the
 # CLI can already send credentials - no extra plugin install is needed.
 #
 # Usage:
 #   azure/scripts/write-bootstrap-profile.sh --profile NAME --password PASS \
-#     --fqdn FQDN [--access public|tailnet] [--user formae] [--port 49684]
+#     --fqdn FQDN [--access public|appgw|tailnet] [--user formae] [--port 49684]
 
 set -euo pipefail
 
 profile="" password="" user="formae" fqdn="" port="49684" access="public"
 
 usage() {
-    sed -n '18,20p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '19,21p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 1
 }
 
@@ -43,16 +45,9 @@ done
 [ -n "$fqdn" ] || { echo "error: --fqdn is required (e.g. formae-bootstrap.eastus.cloudapp.azure.com)" >&2; exit 1; }
 case "$access" in public|appgw|tailnet) ;; *) echo "error: --access must be public, appgw or tailnet" >&2; exit 1 ;; esac
 
-skipverify=""
-if [ "$access" = "public" ]; then
-    # Self-signed certificate: opt in to skipping verification (formae PR #540).
-    skipverify=$'\n        insecureSkipVerify = true'
-elif [ "$access" = "appgw" ]; then
-    # The Application Gateway listens on :443. Its cert is self-signed by default
-    # (skip verification); if you imported a trusted PFX (--cert-pfx), delete the
-    # insecureSkipVerify line below.
-    [ "$port" = "49684" ] && port="443"
-    skipverify=$'\n        insecureSkipVerify = true'
+# The Application Gateway listens on :443, not the agent's listener port.
+if [ "$access" = "appgw" ] && [ "$port" = "49684" ]; then
+    port="443"
 fi
 
 dir="${HOME}/.config/formae/profiles"
@@ -62,17 +57,18 @@ file="${dir}/${profile}.pkl"
 cat > "$file" <<EOF
 amends "formae:/Config.pkl"
 
+import "formae:/Config.pkl" as Config
 import "plugins:/AuthBasic.pkl" as AuthBasic
 
 // Connects to the formae agent stood up by azure/bootstrap.pkl (${access} mode).
 cli {
-    api {
+    connection = new Config.Classic {
         url = "https://${fqdn}"
-        port = ${port}${skipverify}
-    }
-    auth = new AuthBasic.CliConfig {
-        username = "${user}"
-        password = "${password}"
+        port = ${port}
+        auth = new AuthBasic.CliConfig {
+            username = "${user}"
+            password = "${password}"
+        }
     }
 }
 EOF
@@ -80,6 +76,6 @@ EOF
 echo "wrote ${file}"
 echo
 echo "Use it for a single command (leaves your active profile unchanged):"
-echo "  formae status agent --profile ${profile}"
+echo "  formae agent status --profile ${profile}"
 echo "Or make it your default profile (all later commands target this agent):"
 echo "  formae profile use ${profile}"
