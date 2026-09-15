@@ -37,7 +37,7 @@ vmImageVersion = "latest"
 vmAdminUser = "formae"
 osDiskSizeGb = 30
 
-formaeImage = "ghcr.io/platform-engineering-labs/formae:0.87.0"
+formaeImage = "ghcr.io/platform-engineering-labs/formae:0.89.0"
 formaePort = 49684
 
 stack: formae.Stack = new {
