@@ -2,12 +2,10 @@ amends "pkl:Project"
 
 dependencies {
   ["formae"] {
-    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.88.0"
+    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.89.0"
   }
 
-  // TODO(publish): pin to the published aws schema version that includes the IAM
-  // ServerCertificate Resolvable patch (so `serverCert.res.arn` resolves)
   ["aws"] {
-    uri = "package://hub.platform.engineering/plugins/aws/schema/pkl/aws/aws@0.1.13"
+    uri = "package://hub.platform.engineering/plugins/aws/schema/pkl/aws/aws@0.1.17"
   }
 }

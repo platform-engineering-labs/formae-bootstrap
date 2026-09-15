@@ -23,7 +23,6 @@ import "@aws/ec2/natgateway.pkl"
 import "@aws/rds/dbinstance.pkl"
 import "@aws/rds/dbsubnetgroup.pkl"
 import "@aws/secretsmanager/secret.pkl"
-import "@formae/ext/random.pkl"
 
 import "@aws/ecs/ecscluster.pkl"
 import "@aws/ecs/taskdefinition.pkl"
@@ -427,6 +426,7 @@ forma {
         dbSg
         dbSgIngress
         dbSubnetGroup
+        dbPasswordGen
         dbSecret
         db
     }
@@ -641,11 +641,27 @@ local dbSubnetGroup = new dbsubnetgroup.DBSubnetGroup {
     tags = tagged("\(n)-db-subnet-group")
 }
 
+// The database password is drawn by the agent, not minted at evaluation time:
+// a generator draws once per binding (this one has no rotation block, so it
+// never rotates on a schedule), and each generator draws independently, so two
+// secrets can never silently share a value the way identically-parameterized
+// eval-time randomness could. Bound via a differently-named local: writing
+// `stack = ...` inside the generator body resolves against the generator's own
+// property.
+local dbStackRef: formae.StackResolvable = new { label = vars.stack.label }
+
+local dbPasswordGen: formae.PasswordGenerator = new {
+    label = "\(n)-db-password-gen"
+    stack = dbStackRef
+    length = 24
+    symbols = false
+}
+
 local dbSecret = new secret.Secret {
     label = "\(n)-db-secret"
     name = "\(n)-db-password"
     description = "formae database master password (generated)"
-    secretString = formae.value(random.password(24, false)).opaque.setOnce
+    secretString = dbPasswordGen.gen.value
     tags = tagged("\(n)-db-secret")
 }
 
