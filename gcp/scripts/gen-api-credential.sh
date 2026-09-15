@@ -48,7 +48,7 @@ formae agent API credential
      --project <gcp-project> \\
      --api-user ${user} --api-password-hash '${hash}' \\
      --ts-authkey <tskey> --ts-hostname formae-bootstrap \\
-     --watch --status-output-layout detailed
+    
 
 2. After it is up, write a connected CLI profile (keep the password above):
 

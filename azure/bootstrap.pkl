@@ -38,21 +38,25 @@ description {
     example. A long-running VM (the analog of the AWS ECS Fargate task and the
     GCP GCE VM) runs the agent container, in one of three access modes:
 
-    - `public`: the agent terminates HTTPS itself with a self-signed certificate
-      generated on the VM at first boot (server.tlsCert/tlsKey), reachable at a
-      stable <name>.<location>.cloudapp.azure.com FQDN. Basic auth on top;
-      inbound restricted to --allowed-cidr. Connecting requires the CLI's
-      cli.api.insecureSkipVerify knob (formae PR #540).
+    - `public`: the agent terminates HTTPS itself with YOUR certificate
+      (--cert-file + --key-file + --domain), written to the VM by the bootstrap
+      script (server.tlsCert/tlsKey). Basic auth on top; inbound restricted to
+      --allowed-cidr. Point --domain's DNS at the VM's public IP (or CNAME it to
+      the stable <name>.<location>.cloudapp.azure.com FQDN the stack prints).
     - `appgw`: public HTTPS terminated by an Application Gateway v2 in its own
       subnet, fronting the VM (which serves plain HTTP on the API port, reached
       only from the gateway subnet). The gateway's TLS cert is an
-      AZURE::KeyVault::Certificate the stack provisions in a Key Vault it creates
-      (self-signed by default, or your PFX via --cert-pfx), read at runtime via a
+      AZURE::KeyVault::Certificate the stack provisions from YOUR PFX
+      (--cert-pfx + --domain) in a Key Vault it creates, read at runtime via a
       user-assigned identity granted "Key Vault Secrets User". Mirrors the AWS
       `alb` mode (ALB + ACM). Point --domain's DNS at the gateway public IP.
     - `tailnet`: private, reached only over your Tailscale tailnet (no public
       inbound), serving a trusted *.ts.net certificate, with basic auth on top.
       Mirrors the AWS/GCP `tailnet` mode.
+
+    Both public modes require a certificate a client can actually verify: the
+    formae CLI has no TLS-skip knob, so a self-signed certificate would produce
+    an agent nothing can connect to. `tailnet` is the zero-certificate install.
 
     Azure Database for PostgreSQL Flexible Server (public access disabled) backs
     the agent, reached through a Private Endpoint + privatelink DNS zone inside
@@ -100,8 +104,8 @@ class Props {
     /// VM t-shirt size; maps to an Azure VM size (see sizing.pkl).
     size: String = "small"
 
-    /// `public` (self-signed), `appgw` (App Gateway + Key Vault cert), or
-    /// `tailnet` (private, Tailscale).
+    /// `public` (agent-terminated TLS, your PEM), `appgw` (App Gateway + Key
+    /// Vault cert, your PFX), or `tailnet` (private, Tailscale).
     access: String = "public"
 
     /// Full agent image reference. Upgrade the agent by re-applying with a newer tag.
@@ -132,9 +136,21 @@ class Props {
     @formae.Flag { name = "allowed-cidr" }
     allowedCidr: String = "*"
 
-    /// appgw mode only: the hostname clients connect to (must match the cert's
-    /// subject/SAN). Point its DNS at the Application Gateway's public IP.
+    /// public and appgw modes: the hostname clients connect to (must match the
+    /// cert's subject/SAN). Point its DNS at the VM's public IP (public mode) or
+    /// the Application Gateway's public IP (appgw mode).
     domain: String = ""
+
+    /// public mode: path to a PEM certificate chain for --domain, read at apply
+    /// time and written to the VM. Requires --key-file. The AWS --cert-arn analog;
+    /// Azure has no ACM, so the PEMs travel in the extension's protectedSettings.
+    @formae.Flag { name = "cert-file" }
+    certFile: String = ""
+
+    /// public mode: path to the matching PEM private key, read at apply time.
+    /// Requires --cert-file.
+    @formae.Flag { name = "key-file" }
+    keyFile: String = ""
 
     /// appgw mode only: globally-unique Key Vault name (3-24 chars, alphanumeric +
     /// hyphen, starts with a letter). The stack creates this vault to hold the cert.
@@ -148,12 +164,12 @@ class Props {
     @formae.Flag { name = "applier-object-id" }
     applierObjectId: String = ""
 
-    /// appgw mode, optional: base64-encoded PFX to import as the gateway cert. When
-    /// omitted, the stack issues a self-signed cert (works, but not browser-trusted).
+    /// appgw mode: base64-encoded PFX imported as the gateway cert. Required — the
+    /// AWS --cert-arn analog. Must be trusted by clients and match --domain.
     @formae.Flag { name = "cert-pfx" }
     certPfx: String = ""
 
-    /// appgw mode, optional: password for --cert-pfx.
+    /// appgw mode, optional: password for --cert-pfx (omit for a passwordless PFX).
     @formae.Flag { name = "cert-password" }
     certPassword: String = ""
 
@@ -173,18 +189,31 @@ class Props {
 }
 
 // ── Required inputs ───────────────────────────────────────────────────────────
+// AWS/GCP-style fail-fast validation: reject cross-mode flags and missing cert
+// inputs with clear messages before any slow cloud round-trip.
 local access =
     let (a = properties.access)
     if (a != "public" && a != "appgw" && a != "tailnet")
         throw("--access must be \"public\", \"appgw\" or \"tailnet\" (got \"\(a)\")")
+    else if (a == "tailnet" && (properties.domain != "" || properties.certFile != "" || properties.keyFile != "" || properties.certPfx != ""))
+        throw("--domain, --cert-file, --key-file and --cert-pfx apply only to --access public or appgw")
+    else if (a != "tailnet" && (properties.tsAuthkey != "" || properties.tsHostname != ""))
+        throw("--ts-authkey and --ts-hostname apply only to --access tailnet")
+    else if (a == "public" && properties.certPfx != "")
+        throw("--cert-pfx applies only to --access appgw; --access public takes PEMs (--cert-file + --key-file)")
+    else if (a == "appgw" && (properties.certFile != "" || properties.keyFile != ""))
+        throw("--cert-file and --key-file apply only to --access public; --access appgw takes a PFX (--cert-pfx)")
     else a
 local isPublic = access == "public"
 local isAppgw = access == "appgw"
 local isTailnet = access == "tailnet"
 
-// appgw-mode required inputs (referenced only inside the appgw branch).
+// The hostname clients connect to. Required wherever TLS is served to the
+// internet: the certificate must match it, and no formae CLI can skip
+// verification, so a mismatched or untrusted cert is an unreachable agent.
 local domainVal =
-    if (isAppgw && properties.domain == "") throw("--domain is required for --access appgw (the hostname clients connect to; point its DNS at the gateway public IP)")
+    if (isTailnet) properties.domain
+    else if (properties.domain == "") throw("--domain is required for --access \(access) (the hostname clients connect to; it must match your certificate)")
     else properties.domain
 local kvNameVal =
     if (isAppgw && properties.kvName == "") throw("--kv-name is required for --access appgw (a globally-unique Key Vault name, 3-24 chars)")
@@ -192,8 +221,25 @@ local kvNameVal =
 local applierObjectIdVal =
     if (isAppgw && properties.applierObjectId == "") throw("--applier-object-id is required for --access appgw (objectId of the applying principal; az ad sp show --id <client-id> --query id -o tsv)")
     else properties.applierObjectId
-local certPfxVal = properties.certPfx
+local certPfxVal =
+    if (isAppgw && properties.certPfx == "") throw("--cert-pfx is required for --access appgw (a base64-encoded PFX for --domain, trusted by your clients). The AWS --cert-arn analog; there is no self-signed fallback because no formae CLI can skip certificate verification. Use --access tailnet for a certificate-free install.")
+    else properties.certPfx
 local certPasswordVal = properties.certPassword
+
+// public mode: PEM paths, validated as a pair. Read lazily (Pkl only evaluates
+// certPem/keyPem when isPublic), so the tailnet and appgw paths never touch the
+// filesystem. Paths resolve against bootstrap.pkl, not the CWD — pass absolute
+// paths. Verified: formae's evaluator permits `file:` reads.
+local certFileVal =
+    if (!isPublic) properties.certFile
+    else if (properties.certFile == "") throw("--cert-file is required for --access public (a PEM certificate chain for --domain, trusted by your clients). There is no self-signed fallback because no formae CLI can skip certificate verification. Use --access tailnet for a certificate-free install.")
+    else properties.certFile
+local keyFileVal =
+    if (!isPublic) properties.keyFile
+    else if (properties.keyFile == "") throw("--key-file is required for --access public (the PEM private key matching --cert-file)")
+    else properties.keyFile
+local certPem = if (isPublic) read(certFileVal).text else ""
+local keyPem = if (isPublic) read(keyFileVal).text else ""
 
 local subscriptionIdVal =
     if (properties.subscriptionId == "") throw("--subscription-id is required (the Azure subscription ID)")
@@ -228,8 +274,6 @@ local dbServerName = "\(n)-db"
 // Flexible Server FQDNs are deterministic; inside the VNet the privatelink DNS
 // zone resolves this to the private endpoint's IP.
 local dbFqdn = "\(dbServerName).postgres.database.azure.com"
-// public mode: the stable DNS name the self-signed certificate is issued for.
-local agentFqdn = "\(n).\(loc).cloudapp.azure.com"
 
 // Every bootstrap-tier resource carries app=formae-agent and formae-owned=true so the agent's
 // own discovery filter (emitted into the config below) can suppress this stack's
@@ -328,7 +372,7 @@ agent {
 """
 
 // ── VM bootstrap script (Ubuntu 22.04, via CustomScript extension) ────────────
-// Installs docker, prepares mode-specific state (self-signed TLS cert / tsnet
+// Installs docker, prepares mode-specific state (your TLS PEMs / tsnet
 // identity dir), writes the agent config, and starts the agent container. The
 // script re-runs only when the extension resource is replaced, not on reboot;
 // --restart always keeps the containers up across reboots. Because the script
@@ -337,13 +381,19 @@ agent {
 // land. Validated live end-to-end in both access modes.
 local tlsSetup =
     if (isPublic) """
-    # Self-signed certificate for the agent's public FQDN. Regenerated only when
-    # the VM is replaced. Readable by the container's non-root 'pel' user.
+    # Your certificate for \(domainVal), delivered inside this script (which
+    # travels in the extension's protectedSettings: write-only, encrypted by
+    # Azure). Quoted heredocs: PEM text is final, nothing must be expanded.
+    # Rotation = re-apply with new files; the changed script re-runs the
+    # extension and restarts the container.
     # ponytail: world-readable key on a single-purpose VM; swap for a Key Vault
     # certificate + managed identity once the plugin can attach one.
-    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \\
-      -keyout /var/formae/tls.key -out /var/formae/tls.crt \\
-      -subj "/CN=\(agentFqdn)" -addext "subjectAltName=DNS:\(agentFqdn)"
+    cat > /var/formae/tls.crt << 'TLSCRT'
+    \(certPem)
+    TLSCRT
+    cat > /var/formae/tls.key << 'TLSKEY'
+    \(keyPem)
+    TLSKEY
     chmod 0644 /var/formae/tls.crt /var/formae/tls.key
     """
     else if (isTailnet) """
@@ -763,19 +813,14 @@ local roleCertsOfficer = new roleassignment.RoleAssignment {
     roleDefinitionId = "/subscriptions/\(subscriptionIdVal)/providers/Microsoft.Authorization/roleDefinitions/a4417e6f-fecd-4de8-b567-7b0420556985"
 }
 
-// The gateway's TLS certificate. Self-signed by default (works, not browser
-// trusted); pass --cert-pfx (+ --cert-password) to import your own trusted PFX.
+// The gateway's TLS certificate: your PFX (--cert-pfx + --cert-password),
+// imported into the vault. No self-signed fallback — see --cert-pfx.
 local cert = new certificate.Certificate {
     label = "\(n)-cert"
     name = "agent-tls"
     vaultUri = kvVault.res.vaultUri
-    data = if (certPfxVal != "") formae.value(certPfxVal).opaque else null
-    password = if (certPfxVal != "") formae.value(certPasswordVal).opaque else null
-    policy = if (certPfxVal == "") new certificate.Policy {
-        issuerName = "Self"
-        subject = "CN=\(domainVal)"
-        validityMonths = 12
-    } else null
+    data = formae.value(certPfxVal).opaque
+    password = if (certPasswordVal != "") formae.value(certPasswordVal).opaque else null
     tags = commonTags
 }
 

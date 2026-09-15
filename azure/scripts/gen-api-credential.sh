@@ -50,7 +50,7 @@ formae agent API credential
      --api-user ${user} --api-password-hash '${hash}' \\
      --db-password '${dbpassword}' \\
      --ssh-public-key "\$(cat ~/.ssh/id_ed25519.pub)" \\
-     --watch --status-output-layout detailed
+    
 
 2. After it is up, write a connected CLI profile (keep the password above):
 

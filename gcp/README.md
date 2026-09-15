@@ -12,10 +12,10 @@ access modes via `--access` (there is no plaintext option):
 - **`tailnet`** (default) — private, reached only over your Tailscale tailnet (no public
   ingress), serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
 
-> **Version dependency.** `--access public` requires a GCP plugin that implements
+> **Version dependency.** `--access public` needs **GCP plugin ≥ 0.1.9** for
 > `GCP::Compute::InstanceGroup` VM membership (the `instances` field) and the widened
-> `SslCertificate.privateKey`. Until those land in a published release, `gcp/PklProject`
-> points at a **local** plugin checkout; see [Version dependency](#version-dependency).
+> `SslCertificate.privateKey`. Both are published; `gcp/PklProject` pins a released
+> version. See [Version dependency](#version-dependency).
 
 Formae runs as a client and an agent: you use your local install to provision the
 agent's permanent home in the cloud, then point your CLI at it with a profile and hand
@@ -70,13 +70,12 @@ formae apply --mode reconcile gcp/bootstrap.pkl \
   --project <project> \
   --api-user formae --api-password-hash '<hash>' \
   --db-password '<db-password>' \
-  --ts-authkey '<tskey>' --ts-hostname formae-bootstrap \
-  --watch
+  --ts-authkey '<tskey>' --ts-hostname formae-bootstrap
 
 # From a machine on the same tailnet:
 gcp/scripts/write-bootstrap-profile.sh --profile bootstrap \
   --fqdn formae-bootstrap.<your-tailnet>.ts.net --user formae --password '<password>'
-formae status agent --profile bootstrap
+formae agent status --profile bootstrap
 ```
 
 **`public`** (public HTTPS load balancer). Recommended: a **Google-managed certificate** —
@@ -88,8 +87,7 @@ formae apply --mode reconcile gcp/bootstrap.pkl --access public \
   --project <project> \
   --domain formae.example.com \
   --api-user formae --api-password-hash '<hash>' \
-  --db-password '<db-password>' \
-  --watch
+  --db-password '<db-password>'
 ```
 
 Then point `formae.example.com`'s DNS **A record at the reserved global address the stack
@@ -122,7 +120,7 @@ or a self-signed pair for testing). Both create/reference a GCP
 ```bash
 formae apply --mode reconcile gcp/bootstrap.pkl --access public \
   --project <project> --cert-file ./fullchain.pem --key-file ./privkey.pem \
-  --api-user formae --api-password-hash '<hash>' --db-password '<pw>' --watch
+  --api-user formae --api-password-hash '<hash>' --db-password '<pw>'
 ```
 The bootstrap uploads your PEM as a `SELF_MANAGED` `GCP::Compute::SslCertificate` in-stack
 (private key stored opaque).
@@ -142,7 +140,7 @@ CERT=$(gcloud compute ssl-certificates describe my-cert --global \
   --project <project> --format='value(selfLink)')
 formae apply --mode reconcile gcp/bootstrap.pkl --access public \
   --project <project> --cert-name "$CERT" \
-  --api-user formae --api-password-hash '<hash>' --db-password '<pw>' --watch
+  --api-user formae --api-password-hash '<hash>' --db-password '<pw>'
 ```
 
 A self-managed certificate serves immediately (no domain-validation wait, unlike
@@ -152,6 +150,10 @@ IP=$(gcloud compute forwarding-rules describe <name>-fr --global --project <proj
 curl -k --resolve formae.example.com:443:$IP https://formae.example.com/api/v1/health   # 200
 ```
 (`-k` only because a self-signed cert isn't publicly trusted; a real CA cert needs no `-k`.)
+
+> A self-signed certificate is a `curl -k` smoke test only. The formae CLI has no TLS-skip
+> knob, so a profile written by `write-bootstrap-profile.sh` will not connect to one — use a
+> certificate your machine already trusts.
 
 > **Note on `--cert-name`:** pass the certificate's full **selfLink**
 > (`https://www.googleapis.com/compute/v1/projects/.../global/sslCertificates/NAME`), not a
@@ -206,7 +208,7 @@ Destroy the stack, then deregister the target:
 
 ```bash
 formae destroy --query "stack:formae-gcp-bootstrap"
-formae apply --mode destroy gcp/destroy-target.pkl
+formae destroy gcp/destroy-target.pkl
 ```
 
 > **Note:** you currently need to run the `destroy` **twice**. The first pass
@@ -221,10 +223,10 @@ formae apply --mode destroy gcp/destroy-target.pkl
 `--access public` needs **GCP plugin ≥ 0.1.9**, pinned in `gcp/PklProject`:
 
 ```pkl
-["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9" }
+["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.16" }
 ```
 
-0.1.9 carries the features public mode relies on: `GCP::Compute::InstanceGroup.instances`
+0.1.9 introduced the features public mode relies on: `GCP::Compute::InstanceGroup.instances`
 (VM membership), `SslCertificate.privateKey` opaque-wrapping, and SELF_MANAGED
 `selfManaged` nesting (for `--cert-file`). The `tailnet` mode has no such dependency.
 
