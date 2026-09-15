@@ -45,18 +45,19 @@ file="${dir}/${profile}.pkl"
 cat > "$file" <<EOF
 amends "formae:/Config.pkl"
 
+import "formae:/Config.pkl" as Config
 import "plugins:/AuthBasic.pkl" as AuthBasic
 
 // Connects to the formae agent stood up by gcp/bootstrap.pkl (tailnet mode):
 // trusted *.ts.net HTTPS + basic auth, reached over your Tailscale tailnet.
 cli {
-    api {
+    connection = new Config.Classic {
         url = "https://${fqdn}"
         port = ${port}
-    }
-    auth = new AuthBasic.CliConfig {
-        username = "${user}"
-        password = "${password}"
+        auth = new AuthBasic.CliConfig {
+            username = "${user}"
+            password = "${password}"
+        }
     }
 }
 EOF
@@ -64,6 +65,6 @@ EOF
 echo "wrote ${file}"
 echo
 echo "Use it for a single command (leaves your active profile unchanged):"
-echo "  formae status agent --profile ${profile}"
+echo "  formae agent status --profile ${profile}"
 echo "Or make it your default profile (all later commands target this agent):"
 echo "  formae profile use ${profile}"
