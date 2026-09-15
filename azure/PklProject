@@ -2,13 +2,15 @@ amends "pkl:Project"
 
 dependencies {
   ["formae"] {
-    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.88.0"
+    uri = "package://hub.platform.engineering/plugins/pkl/schema/pkl/formae/formae@0.89.0"
   }
 
-  // appgw mode needs App Gateway KV-cert wiring + KeyVault::Certificate + identity
-  // + role assignment, released in the azure plugin 0.1.8. public/tailnet work
-  // with any 0.1.x.
+  // appgw mode needs Network::ApplicationGateway + KeyVault::Certificate +
+  // ManagedIdentity + role assignment. ApplicationGateway and KeyVault::Certificate
+  // landed in 0.1.10, NOT 0.1.8 as previously pinned — on 0.1.8 `--access appgw`
+  // could not even evaluate ("Cannot find module .../keyvault/certificate.pkl").
+  // public/tailnet work with any 0.1.x.
   ["azure"] {
-    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.8"
+    uri = "package://hub.platform.engineering/plugins/azure/schema/pkl/azure/azure@0.1.14"
   }
 }
