@@ -10,7 +10,7 @@ to provision the agent's own permanent home in the cloud, then point your local 
 now-remote agent via a profile and hand off. From then on the remote agent owns your
 infrastructure — reconciling, discovering, and syncing continuously — while your laptop is
 just a client that talks to it. See [`aws/README.md`](aws/README.md#how-this-works) and the
-[architecture overview](https://docs.formae.io) for the full model.
+[architecture overview](https://docs.formae.ai/documentation/concepts/architecture) for the full model.
 
 ## AWS
 

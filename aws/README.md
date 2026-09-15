@@ -52,10 +52,10 @@ formae agent status --profile bootstrap
 Upgrade the agent by re-applying with a newer `--formae-image` (the version knob) — same flags
 as your original apply. **Keep this local install and its datastore:** it holds your agent's own
 infrastructure (VPC, database, ECS service) in state, so re-applying to upgrade depends on it.
-See [Updating the agent](https://docs.formae.io/en/latest/operations/install-aws-operations/#updating-the-agent-bootstrap).
+See [Updating the agent](https://docs.formae.ai/documentation/guides/install-agent#update).
 
 ## Full guide
 
 Prerequisites (ACM certificate, Tailscale setup), every flag, sizing, and day-2 operations
 (updating, shelling in, teardown, tuning) are in the
-**[AWS Bootstrap installation guide](https://docs.formae.io/en/latest/operations/install-aws-bootstrap/)**.
+**[Install and run the agent on AWS](https://docs.formae.ai/documentation/guides/install-agent)**.

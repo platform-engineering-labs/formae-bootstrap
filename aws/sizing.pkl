@@ -7,7 +7,7 @@
 /// Agent sizing. Maps a t-shirt `size` to a Fargate-valid (cpu, memory) pair.
 ///
 /// Capacity guidance mirrors the agent-sizing table at
-/// https://docs.formae.io/en/latest/operations/installation/#agent-sizing
+/// https://docs.formae.ai/documentation/guides/install-agent#reference
 /// but is rounded UP to Fargate's allowed CPU/memory combinations (1 vCPU
 /// requires >=2GB, 2 vCPU >=4GB, 4 vCPU >=8GB) — the doc's raw numbers are not
 /// all Fargate-legal.

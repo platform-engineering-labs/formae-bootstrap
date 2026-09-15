@@ -7,7 +7,7 @@
 /// Agent sizing. Maps a t-shirt `size` to an Azure VM size.
 ///
 /// Capacity guidance mirrors the agent-sizing table at
-/// https://docs.formae.io/en/latest/operations/installation/#agent-sizing
+/// https://docs.formae.ai/documentation/guides/install-agent-azure#reference
 ///
 /// Memory has a FLOOR (~2 GB): the agent image loads all bundled resource
 /// plugins at once (aws + azure + gcp + k8s), a large constant footprint, so
