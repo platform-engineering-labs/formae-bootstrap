@@ -26,12 +26,12 @@ aws/scripts/gen-api-credential.sh
 ```bash
 formae apply --mode reconcile aws/bootstrap.pkl --access alb --region <region> \
   --cert-arn <acm-arn> --domain agent.example.com \
-  --api-user formae --api-password-hash '<hash>' --watch
+  --api-user formae --api-password-hash '<hash>'
 
 # Point agent.example.com at the ALB, then:
 aws/scripts/write-bootstrap-profile.sh --profile bootstrap \
   --domain agent.example.com --user formae --password '<password>'
-formae status agent --profile bootstrap
+formae agent status --profile bootstrap
 ```
 
 **`tailnet`** (needs a reusable Tailscale auth key tagged `tag:formae`, HTTPS certs enabled):
@@ -39,12 +39,12 @@ formae status agent --profile bootstrap
 ```bash
 formae apply --mode reconcile aws/bootstrap.pkl --access tailnet --region <region> \
   --ts-authkey '<tskey>' --ts-hostname formae-bootstrap \
-  --api-user formae --api-password-hash '<hash>' --watch
+  --api-user formae --api-password-hash '<hash>'
 
 # From a machine on the same tailnet:
 aws/scripts/write-bootstrap-profile.sh --profile bootstrap --access tailnet \
   --fqdn formae-bootstrap.<your-tailnet>.ts.net --user formae --password '<password>'
-formae status agent --profile bootstrap
+formae agent status --profile bootstrap
 ```
 
 ## Upgrading

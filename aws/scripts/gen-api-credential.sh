@@ -46,7 +46,7 @@ formae agent API credential
    formae apply --mode reconcile aws/bootstrap.pkl \\
      --api-user ${user} --api-password-hash '${hash}' \\
      --cert-arn <acm-arn> --domain <your-domain> \\
-     --watch --status-output-layout detailed
+    
 
 2. After it is up, write a connected CLI profile (keep the password above — you need it here):
 
