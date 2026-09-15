@@ -12,10 +12,10 @@ access modes via `--access` (there is no plaintext option):
 - **`tailnet`** (default) — private, reached only over your Tailscale tailnet (no public
   ingress), serving a trusted `*.ts.net` certificate, with HTTP basic auth on top.
 
-> **Version dependency.** `--access public` requires a GCP plugin that implements
+> **Version dependency.** `--access public` needs **GCP plugin ≥ 0.1.9** for
 > `GCP::Compute::InstanceGroup` VM membership (the `instances` field) and the widened
-> `SslCertificate.privateKey`. Until those land in a published release, `gcp/PklProject`
-> points at a **local** plugin checkout; see [Version dependency](#version-dependency).
+> `SslCertificate.privateKey`. Both are published; `gcp/PklProject` pins a released
+> version. See [Version dependency](#version-dependency).
 
 Formae runs as a client and an agent: you use your local install to provision the
 agent's permanent home in the cloud, then point your CLI at it with a profile and hand
@@ -223,10 +223,10 @@ formae destroy gcp/destroy-target.pkl
 `--access public` needs **GCP plugin ≥ 0.1.9**, pinned in `gcp/PklProject`:
 
 ```pkl
-["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.9" }
+["gcp"] { uri = "package://hub.platform.engineering/plugins/gcp/schema/pkl/gcp/gcp@0.1.16" }
 ```
 
-0.1.9 carries the features public mode relies on: `GCP::Compute::InstanceGroup.instances`
+0.1.9 introduced the features public mode relies on: `GCP::Compute::InstanceGroup.instances`
 (VM membership), `SslCertificate.privateKey` opaque-wrapping, and SELF_MANAGED
 `selfManaged` nesting (for `--cert-file`). The `tailnet` mode has no such dependency.
 
